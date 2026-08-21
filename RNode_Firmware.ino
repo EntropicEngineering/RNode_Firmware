@@ -111,6 +111,10 @@ void setup() {
 
   #if MCU_VARIANT == MCU_RP2040
     EEPROM.begin(EEPROM_SIZE);
+    // Hardware watchdog: a hard hang reboots the MCU instead of leaving
+    // a silent brick. The host's RNodeInterface reconfigures the radio
+    // automatically when it sees the reset indication after reboot.
+    rp2040.wdt_begin(8000);
   #endif
 
   // Seed the PRNG for CSMA R-value selection
@@ -1493,6 +1497,38 @@ void check_modem_status() {
     update_modem_status();
     update_noise_floor();
 
+    #if MCU_VARIANT == MCU_RP2040
+      // Radio health sentinel. The SX1262 has been observed to silently
+      // fall out of receive mode during long soaks, leaving the modem
+      // deaf while carrier-detect latches block CSMA transmission — all
+      // invisible to the host, since KISS stays responsive. Check once
+      // per second that an online radio is actually in RX or TX, and
+      // recover in stages: re-arm receive, then fully reinitialise.
+      static uint32_t last_radio_check = 0;
+      static uint8_t radio_rx_lost = 0;
+      static uint32_t dcd_high_since = 0;
+      if (radio_online && millis()-last_radio_check >= 1000) {
+        last_radio_check = millis();
+
+        uint8_t om = LoRa->getOperatingMode();
+        if (om != 0x05 && om != 0x06) {  // neither RX nor TX
+          radio_rx_lost++;
+          if (radio_rx_lost >= 6)      { stopRadio(); startRadio(); radio_rx_lost = 0; }
+          else if (radio_rx_lost >= 2) { LoRa->clearIrqFlags(); lora_receive(); }
+        } else { radio_rx_lost = 0; }
+
+        if (dcd) {
+          if (dcd_high_since == 0) { dcd_high_since = millis(); }
+          else if (millis()-dcd_high_since > 30000) {
+            // No LoRa transmission lasts half a minute; a latched
+            // carrier-detect would block CSMA forever. Clear the modem's
+            // IRQ flags and re-arm receive.
+            LoRa->clearIrqFlags(); lora_receive(); dcd_high_since = 0;
+          }
+        } else { dcd_high_since = 0; }
+      }
+    #endif
+
     #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
       util_samples[dcd_sample] = dcd;
       dcd_sample = (dcd_sample+1)%DCD_SAMPLES;
@@ -1706,6 +1742,10 @@ void tx_queue_handler() {
 void work_while_waiting() { loop(); }
 
 void loop() {
+  #if MCU_VARIANT == MCU_RP2040
+    rp2040.wdt_reset();
+  #endif
+
   if (radio_online) {
     #if MCU_VARIANT == MCU_ESP32
       modem_packet_t *modem_packet = NULL;

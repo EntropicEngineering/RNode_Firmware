@@ -533,6 +533,24 @@ uint8_t sx126x::currentRssiRaw() {
   return byte;
 }
 
+// Chip mode from the GetStatus command, bits [6:4] of the status byte:
+// 0x2 STBY_RC, 0x3 STBY_XOSC, 0x4 FS, 0x5 RX, 0x6 TX
+uint8_t sx126x::getOperatingMode() {
+  waitOnBusy();
+  digitalWrite(_ss, LOW);
+  SPI.beginTransaction(_spiSettings);
+  SPI.transfer(OP_STATUS_6X);
+  uint8_t status = SPI.transfer(0x00);
+  SPI.endTransaction();
+  digitalWrite(_ss, HIGH);
+  return (status >> 4) & 0x07;
+}
+
+void sx126x::clearIrqFlags() {
+  uint8_t mask[2] = {0x03, 0xFF};
+  executeOpcode(OP_CLEAR_IRQ_STATUS_6X, mask, 2);
+}
+
 int ISR_VECT sx126x::currentRssi() {
   uint8_t byte = 0;
   executeOpcodeRead(OP_CURRENT_RSSI_6X, &byte, 1);
