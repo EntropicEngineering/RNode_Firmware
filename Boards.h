@@ -21,11 +21,13 @@
   #define PLATFORM_AVR        0x90
   #define PLATFORM_ESP32      0x80
   #define PLATFORM_NRF52      0x70
+  #define PLATFORM_RP2040     0x60
 
   #define MCU_1284P           0x91
   #define MCU_2560            0x92
   #define MCU_ESP32           0x81
   #define MCU_NRF52           0x71
+  #define MCU_RP2040          0x61
 
   // Products, boards and models ////
   #define PRODUCT_RNODE       0x03 // RNode devices
@@ -114,6 +116,11 @@
   #define MODEL_11            0x11 // RAK4631, 433 Mhz
   #define MODEL_12            0x12 // RAK4631, 868 Mhz
 
+  // RAK11300 (RP2040 + SX1262). Provisioned with the RAK4631 product
+  // and model bytes (same radio, same band capabilities), so stock
+  // host tooling needs no changes. The board byte tells them apart.
+  #define BOARD_RAK11300      0x52
+
   #define PRODUCT_HMBRW       0xF0
   #define BOARD_HMBRW         0x32
   #define BOARD_HUZZAH32      0x34
@@ -135,12 +142,17 @@
     #include <variant.h>
     #define PLATFORM PLATFORM_NRF52
     #define MCU_VARIANT MCU_NRF52
+  #elif defined(ARDUINO_ARCH_RP2040)
+    #define PLATFORM PLATFORM_RP2040
+    #define MCU_VARIANT MCU_RP2040
   #else
       #error "The firmware cannot be compiled for the selected MCU variant"
   #endif
 
   #ifndef MODEM
     #if BOARD_MODEL == BOARD_RAK4631
+      #define MODEM SX1262
+    #elif BOARD_MODEL == BOARD_RAK11300
       #define MODEM SX1262
     #elif BOARD_MODEL == BOARD_GENERIC_NRF52
       #define MODEM SX1262
@@ -897,6 +909,50 @@
 
     #else
       #error An unsupported nRF board was selected. Cannot compile RNode firmware.
+    #endif
+
+  #elif MCU_VARIANT == MCU_RP2040
+    #if BOARD_MODEL == BOARD_RAK11300
+      // RAKwireless RAK11300 WisDuo module: RP2040 + SX1262, with the
+      // radio hardwired to the RP2040's SPI1 peripheral. Build with the
+      // arduino-pico core (fqbn rp2040:rp2040:rakwireless_rak11300).
+      #define HAS_EEPROM true
+      #define HAS_DISPLAY false
+      #define HAS_BLUETOOTH false
+      #define HAS_BLE false
+      #define HAS_CONSOLE false
+      #define HAS_PMU false
+      #define HAS_NP false
+      #define HAS_SD false
+      #define HAS_TCXO true
+      #define HAS_RF_SWITCH_RX_TX true
+      #define HAS_BUSY true
+      #define HAS_INPUT false
+      #define DIO2_AS_RF_SWITCH true
+      #define CONFIG_UART_BUFFER_SIZE 6144
+      #define CONFIG_QUEUE_SIZE 6144
+      #define CONFIG_QUEUE_MAX_LENGTH 200
+      #define EEPROM_SIZE 296
+      #define EEPROM_OFFSET EEPROM_SIZE-EEPROM_RESERVED
+
+      // Following pins are for the sx1262
+      const int pin_rxen = 25;      // antenna switch power (module ANT_PWR)
+      const int pin_txen = -1;
+      const int pin_reset = 14;
+      const int pin_cs = 13;
+      const int pin_sclk = 10;
+      const int pin_mosi = 11;
+      const int pin_miso = 12;
+      const int pin_busy = 15;
+      const int pin_dio = 29;       // SX1262 DIO1
+      // The module's SPI0 castellations (unconnected on the cat v0.3
+      // carrier) stand in for status LEDs.
+      const int pin_led_rx = 16;
+      const int pin_led_tx = 17;
+      const int pin_tcxo_enable = -1;
+
+    #else
+      #error An unsupported RP2040 board was selected. Cannot compile RNode firmware.
     #endif
 
   #endif

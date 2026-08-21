@@ -94,6 +94,11 @@
 #elif defined(NRF52840_XXAA)
   extern SPIClass spiModem;
   #define SPI spiModem
+
+#elif BOARD_MODEL == BOARD_RAK11300
+  // The SX1262 is hardwired to the RP2040's SPI1 (GPIO 10/11/12), which
+  // the arduino-pico RAK11300 variant maps to the SPI1 object.
+  #define SPI SPI1
 #endif
 
 #if HAS_LORA_PA
@@ -104,7 +109,9 @@
   int lora_lna_gain = LORA_LNA_GAIN;
 #endif
 
-extern SPIClass SPI;
+#if MCU_VARIANT != MCU_RP2040
+  extern SPIClass SPI;
+#endif
 
 #define MAX_PKT_LENGTH 255
 
@@ -639,14 +646,18 @@ void sx126x::onReceive(void(*callback)(int)){
     buf[7] = 0x00;
     executeOpcode(OP_SET_IRQ_FLAGS_6X, buf, 8);
 
-    #ifdef SPI_HAS_NOTUSINGINTERRUPT
+    // arduino-pico implements usingInterrupt (masking the pin's IRQ for
+    // the duration of every transaction) but does not advertise it via
+    // SPI_HAS_NOTUSINGINTERRUPT, so opt in explicitly on RP2040. This
+    // keeps thread-context radio SPI from being torn by the DIO1 ISR.
+    #if defined(SPI_HAS_NOTUSINGINTERRUPT) || MCU_VARIANT == MCU_RP2040
       SPI.usingInterrupt(digitalPinToInterrupt(_dio0));
     #endif
     attachInterrupt(digitalPinToInterrupt(_dio0), sx126x::onDio0Rise, RISING);
 
   } else {
     detachInterrupt(digitalPinToInterrupt(_dio0));
-    #ifdef SPI_HAS_NOTUSINGINTERRUPT
+    #if defined(SPI_HAS_NOTUSINGINTERRUPT) || MCU_VARIANT == MCU_RP2040
       SPI.notUsingInterrupt(digitalPinToInterrupt(_dio0));
     #endif
   }
@@ -687,7 +698,7 @@ void sx126x::sleep() { uint8_t byte = 0x00; executeOpcode(OP_SLEEP_6X, &byte, 1)
 
 void sx126x::enableTCXO() {
   #if HAS_TCXO
-    #if BOARD_MODEL == BOARD_RAK4631 || BOARD_MODEL == BOARD_HELTEC32_V3 || BOARD_MODEL == BOARD_XIAO_S3
+    #if BOARD_MODEL == BOARD_RAK4631 || BOARD_MODEL == BOARD_RAK11300 || BOARD_MODEL == BOARD_HELTEC32_V3 || BOARD_MODEL == BOARD_XIAO_S3
       uint8_t buf[4] = {MODE_TCXO_3_3V_6X, 0x00, 0x00, 0xFF};
     #elif BOARD_MODEL == BOARD_TBEAM
       uint8_t buf[4] = {MODE_TCXO_1_8V_6X, 0x00, 0x00, 0xFF};

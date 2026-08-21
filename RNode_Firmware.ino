@@ -50,11 +50,27 @@ volatile bool serial_buffering = false;
           uint8_t data[];
   } modem_packet_t;
   static xQueueHandle modem_packet_queue = NULL;
+#elif PLATFORM == PLATFORM_RP2040
+  // Static single-producer (radio ISR), single-consumer (loop) packet
+  // queue. This platform has no FreeRTOS queues, and allocating from
+  // interrupt context is not safe here, so slots are preallocated.
+  #define MODEM_QUEUE_SIZE 8
+  typedef struct {
+          size_t len;
+          int rssi;
+          int snr_raw;
+          uint8_t data[MTU];
+  } modem_packet_t;
+  static modem_packet_t modem_packet_slots[MODEM_QUEUE_SIZE];
+  static volatile uint8_t modem_packet_head = 0; // consumer
+  static volatile uint8_t modem_packet_tail = 0; // producer
+  static inline bool modem_packet_queue_full()  { return (uint8_t)((modem_packet_tail+1) % MODEM_QUEUE_SIZE) == modem_packet_head; }
+  static inline bool modem_packet_queue_empty() { return modem_packet_head == modem_packet_tail; }
 #endif
 
 char sbuf[128];
 
-#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
   bool packet_ready = false;
 #endif
 
@@ -93,14 +109,18 @@ void setup() {
     if (!eeprom_begin()) { Serial.write("EEPROM initialisation failed.\r\n"); }
   #endif
 
+  #if MCU_VARIANT == MCU_RP2040
+    EEPROM.begin(EEPROM_SIZE);
+  #endif
+
   // Seed the PRNG for CSMA R-value selection
   #if MCU_VARIANT == MCU_ESP32
     // On ESP32, get the seed value from the
     // hardware RNG
     unsigned long seed_val = (unsigned long)esp_random();
-  #elif MCU_VARIANT == MCU_NRF52
-    // On nRF, get the seed value from the
-    // hardware RNG
+  #elif MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
+    // On nRF and RP2040, get the seed value
+    // from the hardware RNG
     unsigned long seed_val = get_rng_seed();
   #else
     // Otherwise, get a pseudo-random seed
@@ -129,7 +149,7 @@ void setup() {
     boot_seq();
   #endif
 
-  #if BOARD_MODEL != BOARD_RAK4631 && BOARD_MODEL != BOARD_HELTEC_T114 && BOARD_MODEL != BOARD_TECHO && BOARD_MODEL != BOARD_T3S3 && BOARD_MODEL != BOARD_TBEAM_S_V1 && BOARD_MODEL != BOARD_HELTEC32_V4
+  #if BOARD_MODEL != BOARD_RAK4631 && BOARD_MODEL != BOARD_RAK11300 && BOARD_MODEL != BOARD_HELTEC_T114 && BOARD_MODEL != BOARD_TECHO && BOARD_MODEL != BOARD_T3S3 && BOARD_MODEL != BOARD_TBEAM_S_V1 && BOARD_MODEL != BOARD_HELTEC32_V4
     // Some boards need to wait until the hardware UART is set up before booting
     // the full firmware. In the case of the RAK4631 and Heltec T114, the line below will wait
     // until a serial connection is actually established with a master. Thus, it
@@ -182,7 +202,7 @@ void setup() {
   LoRa->setPins(pin_cs, pin_reset, pin_dio, pin_busy, pin_rxen, pin_txen);
   #endif
   
-  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
     init_channel_stats();
 
     #if BOARD_MODEL == BOARD_T3S3
@@ -198,6 +218,15 @@ void setup() {
       delay(300);
       LoRa->reset();
       delay(100);
+    #endif
+
+    #if BOARD_MODEL == BOARD_RAK11300
+      // An MCU reboot does not power-cycle the radio on this module, so
+      // reset it before probing to recover it from sleep or receive mode.
+      // Run SPI1 at 8 MHz; the SX1262's 16 MHz limit leaves no margin.
+      LoRa->setSPIFrequency(8E6);
+      LoRa->reset();
+      delay(10);
     #endif
 
     // Check installed transceiver chip and
@@ -255,7 +284,7 @@ void setup() {
     update_display();
   #endif
 
-  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
     #if HAS_PMU == true
       pmu_ready = init_pmu();
     #endif
@@ -280,7 +309,7 @@ void setup() {
     }
   #endif
 
-  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
     #if MODEM == SX1280
       avoid_interference = false;
     #else
@@ -331,7 +360,7 @@ inline void kiss_write_packet() {
   serial_write(FEND);
   host_write_len = 0;
 
-  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
     packet_ready = false;
   #endif
 
@@ -357,7 +386,7 @@ inline void getPacketData(uint16_t len) {
 }
 
 void ISR_VECT receive_callback(int packet_size) {
-  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+  #if MCU_VARIANT == MCU_NRF52
     BaseType_t int_mask;
   #endif
 
@@ -383,7 +412,7 @@ void ISR_VECT receive_callback(int packet_size) {
       
       seq = sequence;
 
-      #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
+      #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52 && MCU_VARIANT != MCU_RP2040
         last_rssi = LoRa->packetRssi();
         last_snr_raw = LoRa->packetSnrRaw();
       #endif
@@ -394,7 +423,7 @@ void ISR_VECT receive_callback(int packet_size) {
       // This is the second part of a split
       // packet, so we add it to the buffer
       // and set the ready flag.
-      #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
+      #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52 && MCU_VARIANT != MCU_RP2040
         last_rssi = (last_rssi+LoRa->packetRssi())/2;
         last_snr_raw = (last_snr_raw+LoRa->packetSnrRaw())/2;
       #endif
@@ -415,7 +444,7 @@ void ISR_VECT receive_callback(int packet_size) {
       #endif
       seq = sequence;
 
-      #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
+      #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52 && MCU_VARIANT != MCU_RP2040
         last_rssi = LoRa->packetRssi();
         last_snr_raw = LoRa->packetSnrRaw();
       #endif
@@ -438,7 +467,7 @@ void ISR_VECT receive_callback(int packet_size) {
         seq = SEQ_UNSET;
       }
 
-      #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
+      #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52 && MCU_VARIANT != MCU_RP2040
         last_rssi = LoRa->packetRssi();
         last_snr_raw = LoRa->packetSnrRaw();
       #endif
@@ -448,7 +477,7 @@ void ISR_VECT receive_callback(int packet_size) {
     }
 
     if (ready) {
-      #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
+      #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52 && MCU_VARIANT != MCU_RP2040
         // We first signal the RSSI of the
         // recieved packet to the host.
         kiss_indicate_stat_rssi();
@@ -458,6 +487,19 @@ void ISR_VECT receive_callback(int packet_size) {
         host_write_len = read_len;
         kiss_write_packet(); read_len = 0;
       
+      #elif MCU_VARIANT == MCU_RP2040
+        // Copy the packet into a preallocated queue slot. If the
+        // queue is full, the packet is dropped, mirroring the
+        // behaviour of the dynamic queue on other platforms.
+        if (!modem_packet_queue_full()) {
+          modem_packet_t *modem_packet = &modem_packet_slots[modem_packet_tail];
+          modem_packet->snr_raw = LoRa->packetSnrRaw();
+          modem_packet->rssi = LoRa->packetRssi(modem_packet->snr_raw);
+          modem_packet->len = read_len;
+          memcpy(modem_packet->data, pbuf, read_len);
+          modem_packet_tail = (uint8_t)((modem_packet_tail+1) % MODEM_QUEUE_SIZE);
+        }
+        read_len = 0;
       #else
         // Allocate packet struct, but abort if there
         // is not enough memory available.
@@ -485,7 +527,7 @@ void ISR_VECT receive_callback(int packet_size) {
     // output directly to the host
     read_len = 0;
 
-    #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
+    #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52 && MCU_VARIANT != MCU_RP2040
       last_rssi = LoRa->packetRssi();
       last_snr_raw = LoRa->packetSnrRaw();
       getPacketData(packet_size);
@@ -577,7 +619,7 @@ void flush_queue(void) {
     queue_flushing = true;
     led_tx_on();
 
-    #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+    #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
     while (!fifo16_isempty(&packet_starts)) {
     #else
     while (!fifo16_isempty_locked(&packet_starts)) {
@@ -602,7 +644,7 @@ void flush_queue(void) {
   queue_height = 0;
   queued_bytes = 0;
 
-  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
     update_airtime();
   #endif
 
@@ -617,7 +659,7 @@ void pop_queue() {
   if (!queue_flushing) {
     queue_flushing = true; led_tx_on();
 
-    #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+    #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
     if (!fifo16_isempty(&packet_starts)) {
     #else
     if (!fifo16_isempty_locked(&packet_starts)) {
@@ -640,7 +682,7 @@ void pop_queue() {
     lora_receive(); led_tx_off();
   }
 
-  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
     update_airtime();
   #endif
 
@@ -652,7 +694,7 @@ void pop_queue() {
 }
 
 void add_airtime(uint16_t written) {
-  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
     float lora_symbols = 0;
     float packet_cost_ms = 0.0;
     int ldr_opt = 0; if (lora_low_datarate) ldr_opt = 1;
@@ -691,7 +733,7 @@ void add_airtime(uint16_t written) {
 }
 
 void update_airtime() {
-  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
     uint16_t cb = current_airtime_bin();
     uint16_t pb = cb-1; if (cb-1 < 0) { pb = AIRTIME_BINS-1; }
     uint16_t nb = cb+1; if (nb == AIRTIME_BINS) { nb = 0; }
@@ -705,7 +747,7 @@ void update_airtime() {
     for (uint16_t bin = 0; bin < AIRTIME_BINS; bin++) { longterm_channel_util_sum += longterm_bins[bin]; }
     longterm_channel_util = (float)longterm_channel_util_sum/(float)AIRTIME_BINS;
 
-    #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+    #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
       update_csma_parameters();
     #endif
 
@@ -1081,13 +1123,13 @@ void serial_callback(uint8_t sbyte) {
     } else if (command == CMD_DISP_READ) {
       if (sbyte != 0x00) { kiss_indicate_disp(); }
     } else if (command == CMD_DEV_HASH) {
-      #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+      #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
         if (sbyte != 0x00) {
           kiss_indicate_device_hash();
         }
       #endif
     } else if (command == CMD_DEV_SIG) {
-      #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+      #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
         if (sbyte == FESC) {
               ESCAPE = true;
           } else {
@@ -1111,7 +1153,7 @@ void serial_callback(uint8_t sbyte) {
         firmware_update_mode = false;
       }
     } else if (command == CMD_HASHES) {
-      #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+      #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
         if (sbyte == 0x01) {
           kiss_indicate_target_fw_hash();
         } else if (sbyte == 0x02) {
@@ -1123,7 +1165,7 @@ void serial_callback(uint8_t sbyte) {
         }
       #endif
     } else if (command == CMD_FW_HASH) {
-      #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+      #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
         if (sbyte == FESC) {
               ESCAPE = true;
           } else {
@@ -1356,7 +1398,7 @@ bool noise_floor_sampled = false;
 int  noise_floor_sample  = 0;
 int  noise_floor_buffer[NOISE_FLOOR_SAMPLES] = {0};
 void update_noise_floor() {
-  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
     if (!dcd) {
       #if BOARD_MODEL != BOARD_HELTEC32_V4
       if (!noise_floor_sampled || current_rssi < noise_floor + CSMA_INFR_THRESHOLD_DB) {
@@ -1396,6 +1438,8 @@ void update_modem_status() {
     portENTER_CRITICAL(&update_lock);
   #elif MCU_VARIANT == MCU_NRF52
     portENTER_CRITICAL();
+  #elif MCU_VARIANT == MCU_RP2040
+    noInterrupts();
   #endif
 
   bool carrier_detected = LoRa->dcd();
@@ -1406,6 +1450,8 @@ void update_modem_status() {
     portEXIT_CRITICAL(&update_lock);
   #elif MCU_VARIANT == MCU_NRF52
     portEXIT_CRITICAL();
+  #elif MCU_VARIANT == MCU_RP2040
+    interrupts();
   #endif
 
   #if BOARD_MODEL == BOARD_HELTEC32_V4
@@ -1447,7 +1493,7 @@ void check_modem_status() {
     update_modem_status();
     update_noise_floor();
 
-    #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+    #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
       util_samples[dcd_sample] = dcd;
       dcd_sample = (dcd_sample+1)%DCD_SAMPLES;
       if (dcd_sample % UTIL_UPDATE_INTERVAL == 0) {
@@ -1494,6 +1540,12 @@ void validate_status() {
       uint8_t F_POR = 0x00;
       uint8_t F_BOR = 0x00;
       uint8_t F_WDR = 0x01;
+  #elif MCU_VARIANT == MCU_RP2040
+      // TODO: Get RP2040 boot flags
+      uint8_t boot_flags = 0x02;
+      uint8_t F_POR = 0x00;
+      uint8_t F_BOR = 0x00;
+      uint8_t F_WDR = 0x01;
   #endif
 
   if (hw_ready || device_init_done) {
@@ -1531,7 +1583,7 @@ void validate_status() {
         if (eeprom_checksum_valid()) {
           eeprom_ok = true;
           if (modem_installed) {
-            #if PLATFORM == PLATFORM_ESP32 || PLATFORM == PLATFORM_NRF52
+            #if PLATFORM == PLATFORM_ESP32 || PLATFORM == PLATFORM_NRF52 || PLATFORM == PLATFORM_RP2040
               if (device_init()) {
                 hw_ready = true;
               } else {
@@ -1599,7 +1651,7 @@ void validate_status() {
   }
 }
 
-#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
   void update_csma_parameters() {
     int airtime_pct = (int)(airtime*100);
     int new_cw_band = cw_band;
@@ -1695,6 +1747,24 @@ void loop() {
       if (st_airtime_limit != 0.0 && airtime >= st_airtime_limit) airtime_lock = true;
       if (lt_airtime_limit != 0.0 && longterm_airtime >= lt_airtime_limit) airtime_lock = true;
 
+    #elif MCU_VARIANT == MCU_RP2040
+      if (!modem_packet_queue_empty()) {
+        modem_packet_t *modem_packet = &modem_packet_slots[modem_packet_head];
+        host_write_len = modem_packet->len;
+        last_rssi      = modem_packet->rssi;
+        last_snr_raw   = modem_packet->snr_raw;
+        memcpy(&pbuf, modem_packet->data, modem_packet->len);
+        modem_packet_head = (uint8_t)((modem_packet_head+1) % MODEM_QUEUE_SIZE);
+
+        kiss_indicate_stat_rssi();
+        kiss_indicate_stat_snr();
+        kiss_write_packet();
+      }
+
+      airtime_lock = false;
+      if (st_airtime_limit != 0.0 && airtime >= st_airtime_limit) airtime_lock = true;
+      if (lt_airtime_limit != 0.0 && longterm_airtime >= lt_airtime_limit) airtime_lock = true;
+
     #endif
 
     tx_queue_handler();
@@ -1716,11 +1786,16 @@ void loop() {
     }
   }
 
-  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
       buffer_serial();
       if (!fifo_isempty(&serialFIFO)) serial_poll();
   #else
     if (!fifo_isempty_locked(&serialFIFO)) serial_poll();
+  #endif
+
+  #if MCU_VARIANT == MCU_RP2040
+    // Commit any pending EEPROM writes once the write burst has settled
+    eeprom_service();
   #endif
 
   #if HAS_DISPLAY
@@ -1805,7 +1880,7 @@ void sleep_now() {
 }
 
 void button_event(uint8_t event, unsigned long duration) {
-  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
     if (display_blanked) {
       display_unblank();
     } else {
@@ -1846,7 +1921,7 @@ volatile bool serial_polling = false;
 void serial_poll() {
   serial_polling = true;
 
-  #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
+  #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52 && MCU_VARIANT != MCU_RP2040
   while (!fifo_isempty_locked(&serialFIFO)) {
   #else
   while (!fifo_isempty(&serialFIFO)) {
@@ -1884,7 +1959,7 @@ void buffer_serial() {
     {
       c++;
 
-      #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
+      #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52 && MCU_VARIANT != MCU_RP2040
         if (!fifo_isfull_locked(&serialFIFO)) { fifo_push_locked(&serialFIFO, Serial.read()); }
       #elif HAS_BLUETOOTH || HAS_BLE == true || HAS_WIFI
         if      (bt_state == BT_STATE_CONNECTED) { if (!fifo_isfull(&serialFIFO)) { fifo_push(&serialFIFO, SerialBT.read()); } }

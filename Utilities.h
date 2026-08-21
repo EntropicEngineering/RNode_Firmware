@@ -72,7 +72,7 @@ uint8_t eeprom_read(uint32_t mapped_addr);
 	#include "Input.h"
 #endif
 
-#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
 	#include "Device.h"
 #endif
 #if MCU_VARIANT == MCU_ESP32
@@ -127,6 +127,13 @@ uint8_t boot_vector = 0x00;
 		nrf_rng_event_clear(NRF_RNG, NRF_RNG_EVENT_VALRDY);
 		nrf_rng_task_trigger(NRF_RNG, NRF_RNG_TASK_STOP);
 		return rb_a << 24 | rb_b << 16 | rb_c << 8 | rb_d;
+	}
+#endif
+
+#if MCU_VARIANT == MCU_RP2040
+	unsigned long get_rng_seed() {
+		// arduino-pico hardware entropy (ROSC-derived)
+		return rp2040.hwrand32();
 	}
 #endif
 
@@ -372,6 +379,31 @@ uint8_t boot_vector = 0x00;
 		void led_id_on()  { }
 		void led_id_off() { }
 	#endif
+#elif MCU_VARIANT == MCU_RP2040
+	#if BOARD_MODEL == BOARD_RAK11300
+		void led_rx_on()  { digitalWrite(pin_led_rx, HIGH); }
+		void led_rx_off() {	digitalWrite(pin_led_rx, LOW); }
+		void led_tx_on()  { digitalWrite(pin_led_tx, HIGH); }
+		void led_tx_off() { digitalWrite(pin_led_tx, LOW); }
+		void led_id_on()  { }
+		void led_id_off() { }
+	#endif
+#endif
+
+#if MCU_VARIANT == MCU_RP2040
+	// EEPROM writes land in the RAM shadow immediately and are committed
+	// to flash after a short quiet period. Committing on every byte would
+	// stall the MCU (and USB) for a full flash sector erase per byte,
+	// which drops incoming host data during EEPROM bootstrap.
+	#define EEPROM_COMMIT_QUIET_MS 250
+	bool eeprom_dirty = false;
+	unsigned long eeprom_dirty_at = 0;
+	void eeprom_flush_rp2040() {
+		if (eeprom_dirty) { EEPROM.commit(); eeprom_dirty = false; }
+	}
+	void eeprom_service() {
+		if (eeprom_dirty && millis()-eeprom_dirty_at >= EEPROM_COMMIT_QUIET_MS) { eeprom_flush_rp2040(); }
+	}
 #endif
 
 void hard_reset(void) {
@@ -384,6 +416,9 @@ void hard_reset(void) {
 		ESP.restart();
 	#elif MCU_VARIANT == MCU_NRF52
     NVIC_SystemReset();
+	#elif MCU_VARIANT == MCU_RP2040
+    eeprom_flush_rp2040();
+    rp2040.reboot();
 	#endif
 }
 
@@ -484,7 +519,7 @@ void led_indicate_warning(int cycles) {
 	  }
 	  led_rx_off();
 	}
-#elif MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+#elif MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
 	#if HAS_NP == true
 		void led_indicate_info(int cycles) {
 			bool forever = (cycles == 0) ? true : false;
@@ -588,7 +623,7 @@ unsigned long led_standby_ticks = 0;
 		unsigned long led_notready_wait = 150;
 	#endif
 
-#elif MCU_VARIANT == MCU_NRF52
+#elif MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
         int led_standby_lng = 200;
         int led_standby_cut = 100;
 		uint8_t led_standby_min = 200;
@@ -621,7 +656,7 @@ int8_t  led_standby_direction = 0;
 		}
 	}
 
-#elif MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+#elif MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
 	#if HAS_NP == true
 		void led_indicate_standby() {
 			led_standby_ticks++;
@@ -737,7 +772,7 @@ int8_t  led_standby_direction = 0;
 			led_rx_off();
 		}
 	}
-#elif MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+#elif MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
 	#if HAS_NP == true
     void led_indicate_not_ready() {
     	led_standby_ticks++;
@@ -957,7 +992,7 @@ void kiss_indicate_lt_alock() {
 }
 
 void kiss_indicate_channel_stats() {
-	#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+	#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
 		uint16_t ats = (uint16_t)(airtime*100*100);
 		uint16_t atl = (uint16_t)(longterm_airtime*100*100);
 		uint16_t cls = (uint16_t)(total_channel_util*100*100);
@@ -983,7 +1018,7 @@ void kiss_indicate_channel_stats() {
 }
 
 void kiss_indicate_csma_stats() {
-	#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+	#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
 		serial_write(FEND);
 		serial_write(CMD_STAT_CSMA);
 		escaped_serial_write(cw_band);
@@ -994,7 +1029,7 @@ void kiss_indicate_csma_stats() {
 }
 
 void kiss_indicate_phy_stats() {
-	#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+	#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
 		uint16_t lst = (uint16_t)(lora_symbol_time_ms*1000);
 		uint16_t lsr = (uint16_t)(lora_symbol_rate);
 		uint16_t prs = (uint16_t)(lora_preamble_symbols);
@@ -1014,7 +1049,7 @@ void kiss_indicate_phy_stats() {
 }
 
 void kiss_indicate_battery() {
-	#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+	#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
 		serial_write(FEND);
 		serial_write(CMD_STAT_BAT);
 		escaped_serial_write(battery_state);
@@ -1070,7 +1105,7 @@ void kiss_indicate_fbstate() {
 	serial_write(FEND);
 }
 
-#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
 	void kiss_indicate_device_hash() {
 	  serial_write(FEND);
 	  serial_write(CMD_DEV_HASH);
@@ -1229,7 +1264,7 @@ void setPreamble() {
 }
 
 void updateBitrate() {
-	#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+	#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
 		if (!radio_online) { lora_bitrate = 0; }
 		else {
 			lora_symbol_rate = (float)lora_bw/(float)(pow(2, lora_sf));
@@ -1560,6 +1595,11 @@ void eeprom_update(int mapped_addr, uint8_t byte) {
 			EEPROM.write(mapped_addr, byte);
 			EEPROM.commit();
 		}
+	#elif MCU_VARIANT == MCU_RP2040
+		if (EEPROM.read(mapped_addr) != byte) {
+			EEPROM.write(mapped_addr, byte);
+			eeprom_dirty = true; eeprom_dirty_at = millis();
+		}
   #elif !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
     // todo: clean up this implementation, writing one byte and syncing
     // each time is really slow, but this is also suboptimal
@@ -1620,6 +1660,8 @@ bool eeprom_product_valid() {
 	if (rval == PRODUCT_RNODE || rval == BOARD_RNODE_NG_20 || rval == BOARD_RNODE_NG_21 || rval == PRODUCT_HMBRW || rval == PRODUCT_TBEAM || rval == PRODUCT_T32_10 || rval == PRODUCT_T32_20 || rval == PRODUCT_T32_21 || rval == PRODUCT_H32_V2 || rval == PRODUCT_H32_V3 || rval == PRODUCT_H32_V4 || rval == PRODUCT_TDECK_V1 || rval == PRODUCT_TBEAM_S_V1  || rval == PRODUCT_XIAO_S3) {
 	#elif PLATFORM == PLATFORM_NRF52
 	if (rval == PRODUCT_RAK4631 || rval == PRODUCT_HELTEC_T114 || rval == PRODUCT_TECHO || rval == PRODUCT_HMBRW) {
+	#elif PLATFORM == PLATFORM_RP2040
+	if (rval == PRODUCT_RAK4631 || rval == PRODUCT_HMBRW) {
 	#else
 	if (false) {
 	#endif
@@ -1671,6 +1713,8 @@ bool eeprom_model_valid() {
   if (model == MODEL_C6 || model == MODEL_C7) {
   #elif BOARD_MODEL == BOARD_RAK4631
   if (model == MODEL_11 || model == MODEL_12) {
+  #elif BOARD_MODEL == BOARD_RAK11300
+  if (model == MODEL_11 || model == MODEL_12 || model == MODEL_FE || model == MODEL_FF) {
 	#elif BOARD_MODEL == BOARD_HUZZAH32
 	if (model == MODEL_FF) {
 	#elif BOARD_MODEL == BOARD_GENERIC_ESP32
@@ -1856,7 +1900,7 @@ void unlock_rom() {
 }
 
 void init_channel_stats() {
-	#if MCU_VARIANT == MCU_ESP32
+	#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_RP2040
 		for (uint16_t ai = 0; ai < DCD_SAMPLES; ai++) { util_samples[ai] = false; }
 		for (uint16_t ai = 0; ai < AIRTIME_BINS; ai++) { airtime_bins[ai] = 0; }
 		for (uint16_t ai = 0; ai < AIRTIME_BINS; ai++) { longterm_bins[ai] = 0.0; }
@@ -1906,7 +1950,7 @@ inline void fifo_flush(FIFOBuffer *f) {
   f->head = f->tail;
 }
 
-#if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
+#if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52 && MCU_VARIANT != MCU_RP2040
 	static inline bool fifo_isempty_locked(const FIFOBuffer *f) {
 	  bool result;
 	  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
@@ -1988,7 +2032,7 @@ inline void fifo16_flush(FIFOBuffer16 *f) {
   f->head = f->tail;
 }
 
-#if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
+#if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52 && MCU_VARIANT != MCU_RP2040
 	static inline bool fifo16_isempty_locked(const FIFOBuffer16 *f) {
 	  bool result;
 	  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {

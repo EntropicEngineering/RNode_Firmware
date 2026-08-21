@@ -40,6 +40,17 @@
 #define IMG_SIZE_START 0xFF008
 #endif
 
+#elif MCU_VARIANT == MCU_RP2040
+#include <SHA256.h>
+#include "pico/unique_id.h"
+
+// size of chunk to hash per iteration
+#define CHUNK_SIZE 128
+
+// The flash-resident application image spans from the start of the
+// XIP-mapped flash to the linker-provided end-of-binary symbol.
+extern "C" { extern char __flash_binary_end[]; }
+
 #endif
 
 // Forward declaration from Utilities.h
@@ -182,6 +193,24 @@ void calculate_region_hash(unsigned long long start, unsigned long long end, uin
 }
 #endif
 
+#if MCU_VARIANT == MCU_RP2040
+void calculate_region_hash(unsigned long long start, unsigned long long end, uint8_t* return_hash) {
+    // hash a region of the XIP-mapped flash address space
+    uint8_t chunk[CHUNK_SIZE];
+    SHA256 hash;
+    hash.reset();
+
+    while (start < end) {
+        const void* src = (const void*)(uintptr_t)start;
+        size_t size = (start + CHUNK_SIZE >= end) ? (size_t)(end - start) : CHUNK_SIZE;
+        memcpy(chunk, src, size);
+        hash.update(chunk, size);
+        start += size;
+    }
+    hash.finalize(return_hash, DEV_HASH_LEN);
+}
+#endif
+
 void device_validate_partitions() {
   device_load_firmware_hash();
   #if MCU_VARIANT == MCU_ESP32
@@ -198,6 +227,13 @@ void device_validate_partitions() {
   #elif MCU_VARIANT == MCU_NRF52
   // todo, add bootloader, partition table, or softdevice?
   calculate_region_hash(APPLICATION_START, APPLICATION_START+retrieve_application_size(), dev_firmware_hash);
+  #elif MCU_VARIANT == MCU_RP2040
+  // Hash the complete flash-resident binary (boot2 + application),
+  // XIP_BASE up to the linker's end-of-binary symbol. The EEPROM
+  // emulation sector at the end of flash is not part of the binary.
+  calculate_region_hash((unsigned long long)XIP_BASE,
+                        (unsigned long long)(uintptr_t)__flash_binary_end,
+                        dev_firmware_hash);
   #endif
   #if VALIDATE_FIRMWARE
     for (uint8_t i = 0; i < DEV_HASH_LEN; i++) {
@@ -213,9 +249,14 @@ bool device_firmware_ok() {
   return fw_signature_validated;
 }
 
-#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
 bool device_init() {
+  #if MCU_VARIANT == MCU_RP2040
+  // No Bluetooth stack on this platform, so no bt_ready gate
+  if (true) {
+  #else
   if (bt_ready) {
+  #endif
     #if MCU_VARIANT == MCU_ESP32
     for (uint8_t i=0; i<EEPROM_SIG_LEN; i++){dev_eeprom_signature[i]=EEPROM.read(eeprom_addr(ADDR_SIGNATURE+i));}
     mbedtls_md_context_t ctx;
@@ -249,6 +290,19 @@ bool device_init() {
     hash.update(dev_eeprom_signature, EEPROM_SIG_LEN);
 
     hash.end(dev_hash);
+    #elif MCU_VARIANT == MCU_RP2040
+    for (uint8_t i=0; i<EEPROM_SIG_LEN; i++){dev_eeprom_signature[i]=EEPROM.read(eeprom_addr(ADDR_SIGNATURE+i));}
+
+    // Bind the device hash to this specific RP2040 via its flash
+    // unique id, in place of the Bluetooth MAC used on other platforms
+    pico_unique_board_id_t board_id;
+    pico_get_unique_board_id(&board_id);
+
+    SHA256 hash;
+    hash.reset();
+    hash.update(board_id.id, PICO_UNIQUE_BOARD_ID_SIZE_BYTES);
+    hash.update(dev_eeprom_signature, EEPROM_SIG_LEN);
+    hash.finalize(dev_hash, DEV_HASH_LEN);
     #endif
     device_load_signature();
     device_validate_signature();
