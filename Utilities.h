@@ -853,6 +853,9 @@ void serial_write(uint8_t byte) {
 		}
 	#else
 		Serial.write(byte);
+		#if MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
+			Serial2.write(byte);
+		#endif
 	#endif
 }
 

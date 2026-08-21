@@ -145,6 +145,19 @@ void setup() {
 
   Serial.begin(serial_baudrate);
 
+  #if MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
+    // Mirror the host interface on hardware UART1 (the system-controller
+    // link on carrier boards like cat v0.3). The arduino-pico RAK11300
+    // variant's PIN_SERIAL2 defines are TX/RX-swapped — RP2040 silicon only
+    // muxes UART1 TX to GPIO4/8 and RX to GPIO5/9 — so set the real pins.
+    Serial2.setTX(4);
+    Serial2.setRX(5);
+    Serial2.setFIFOSize(CONFIG_UART_BUFFER_SIZE);
+    Serial2.begin(serial_baudrate);
+    // Keep RX idle-high when the far side is unpowered or tri-stated.
+    gpio_set_pulls(5, true, false);
+  #endif
+
   #if HAS_NP
     led_init();
   #endif
@@ -2021,6 +2034,8 @@ void buffer_serial() {
       ( (bt_state != BT_STATE_CONNECTED && Serial.available()) || (bt_state == BT_STATE_CONNECTED && SerialBT.available()) )
       #endif
       )
+    #elif MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
+    while (c < MAX_CYCLES && (Serial.available() || Serial2.available()))
     #else
     while (c < MAX_CYCLES && Serial.available())
     #endif
@@ -2035,6 +2050,9 @@ void buffer_serial() {
         else if (wifi_host_is_connected())       { if (!fifo_isfull(&serialFIFO)) { fifo_push(&serialFIFO, wifi_remote_read()); } }
         #endif
         else                                     { if (!fifo_isfull(&serialFIFO)) { fifo_push(&serialFIFO, Serial.read()); } }
+      #elif MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
+        if (Serial.available()) { if (!fifo_isfull(&serialFIFO)) { fifo_push(&serialFIFO, Serial.read()); } }
+        else                    { if (!fifo_isfull(&serialFIFO)) { fifo_push(&serialFIFO, Serial2.read()); } }
       #else
         if (!fifo_isfull(&serialFIFO)) { fifo_push(&serialFIFO, Serial.read()); }
       #endif

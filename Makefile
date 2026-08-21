@@ -150,6 +150,11 @@ firmware-rak4631:
 firmware-rak11300:
 	arduino-cli compile --log --fqbn rp2040:rp2040:rakwireless_rak11300 -e --build-property "compiler.cpp.extra_flags=\"-DBOARD_MODEL=0x52\""
 
+# As above, plus the host interface mirrored on UART1 (GPIO4 TX / GPIO5 RX)
+# for carrier boards whose system controller talks KISS over UART.
+firmware-rak11300-uarthost:
+	arduino-cli compile --log --fqbn rp2040:rp2040:rakwireless_rak11300 -e --build-property "compiler.cpp.extra_flags=\"-DBOARD_MODEL=0x52\" \"-DRNODE_RP2040_UART_HOST\""
+
 firmware-heltec_t114:
 	arduino-cli compile --log --fqbn Heltec_nRF52:Heltec_nRF52:HT-n5262 -e --build-property "build.partitions=no_ota" --build-property "upload.maximum_size=2097152" --build-property "compiler.cpp.extra_flags=\"-DBOARD_MODEL=0x3C\""
 
