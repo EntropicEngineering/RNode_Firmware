@@ -1492,42 +1492,64 @@ void update_modem_status() {
   }
 }
 
+#if MCU_VARIANT == MCU_RP2040
+  // Radio health sentinel. The SX1262 has been observed to lose its
+  // level-held DIO1 interrupt and silently stop delivering packets,
+  // with latched carrier-detect then blocking CSMA transmission — all
+  // invisible to the host, since KISS stays responsive. Runs from
+  // loop() directly: it must NOT live inside check_modem_status()'s
+  // timed body, which starves whenever a backed-up TX queue makes
+  // tx_queue_handler() poll update_modem_status() every pass.
+  void rp2040_radio_sentinel() {
+    static uint32_t last_radio_check = 0;
+    static uint8_t radio_rx_lost = 0;
+    static uint32_t dcd_high_since = 0;
+    if (radio_online && millis()-last_radio_check >= 1000) {
+      last_radio_check = millis();
+
+      uint8_t om = LoRa->getOperatingMode();
+
+      // 0x7D: RP2040 diagnostic telemetry, 1 Hz. Emitted before any
+      // recovery action so the tape shows the pre-recovery state.
+      uint16_t irqf = LoRa->getIrqFlags();
+      uint8_t dbg_flags = (dcd ? 1 : 0) | (interference_detected ? 2 : 0)
+                        | (airtime_lock ? 4 : 0) | (queue_flushing ? 8 : 0);
+      serial_write(FEND); serial_write(0x7D);
+      escaped_serial_write(om);
+      escaped_serial_write(irqf >> 8); escaped_serial_write(irqf & 0xFF);
+      escaped_serial_write(dbg_flags);
+      escaped_serial_write(radio_rx_lost);
+      escaped_serial_write(queue_height);
+      escaped_serial_write(queued_bytes >> 8); escaped_serial_write(queued_bytes & 0xFF);
+      escaped_serial_write(queue_cursor >> 8); escaped_serial_write(queue_cursor & 0xFF);
+      escaped_serial_write(current_packet_start >> 8); escaped_serial_write(current_packet_start & 0xFF);
+      escaped_serial_write((uint8_t)csma_cw);
+      escaped_serial_write((uint8_t)(noise_floor+rssi_offset));
+      serial_write(FEND);
+
+      if (om != 0x05 && om != 0x06) {  // neither RX nor TX
+        radio_rx_lost++;
+        if (radio_rx_lost >= 6)      { stopRadio(); startRadio(); radio_rx_lost = 0; }
+        else if (radio_rx_lost >= 2) { LoRa->clearIrqFlags(); lora_receive(); }
+      } else { radio_rx_lost = 0; }
+
+      if (dcd) {
+        if (dcd_high_since == 0) { dcd_high_since = millis(); }
+        else if (millis()-dcd_high_since > 30000) {
+          // No LoRa transmission lasts half a minute; a latched
+          // carrier-detect would block CSMA forever. Clear the modem's
+          // IRQ flags and re-arm receive.
+          LoRa->clearIrqFlags(); lora_receive(); dcd_high_since = 0;
+        }
+      } else { dcd_high_since = 0; }
+    }
+  }
+#endif
+
 void check_modem_status() {
   if (millis()-last_status_update >= status_interval_ms) {
     update_modem_status();
     update_noise_floor();
-
-    #if MCU_VARIANT == MCU_RP2040
-      // Radio health sentinel. The SX1262 has been observed to silently
-      // fall out of receive mode during long soaks, leaving the modem
-      // deaf while carrier-detect latches block CSMA transmission — all
-      // invisible to the host, since KISS stays responsive. Check once
-      // per second that an online radio is actually in RX or TX, and
-      // recover in stages: re-arm receive, then fully reinitialise.
-      static uint32_t last_radio_check = 0;
-      static uint8_t radio_rx_lost = 0;
-      static uint32_t dcd_high_since = 0;
-      if (radio_online && millis()-last_radio_check >= 1000) {
-        last_radio_check = millis();
-
-        uint8_t om = LoRa->getOperatingMode();
-        if (om != 0x05 && om != 0x06) {  // neither RX nor TX
-          radio_rx_lost++;
-          if (radio_rx_lost >= 6)      { stopRadio(); startRadio(); radio_rx_lost = 0; }
-          else if (radio_rx_lost >= 2) { LoRa->clearIrqFlags(); lora_receive(); }
-        } else { radio_rx_lost = 0; }
-
-        if (dcd) {
-          if (dcd_high_since == 0) { dcd_high_since = millis(); }
-          else if (millis()-dcd_high_since > 30000) {
-            // No LoRa transmission lasts half a minute; a latched
-            // carrier-detect would block CSMA forever. Clear the modem's
-            // IRQ flags and re-arm receive.
-            LoRa->clearIrqFlags(); lora_receive(); dcd_high_since = 0;
-          }
-        } else { dcd_high_since = 0; }
-      }
-    #endif
 
     #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
       util_samples[dcd_sample] = dcd;
@@ -1744,6 +1766,7 @@ void work_while_waiting() { loop(); }
 void loop() {
   #if MCU_VARIANT == MCU_RP2040
     rp2040.wdt_reset();
+    rp2040_radio_sentinel();
   #endif
 
   if (radio_online) {

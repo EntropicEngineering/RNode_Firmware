@@ -546,6 +546,12 @@ uint8_t sx126x::getOperatingMode() {
   return (status >> 4) & 0x07;
 }
 
+uint16_t sx126x::getIrqFlags() {
+  uint8_t buf[2] = {0, 0};
+  executeOpcodeRead(OP_GET_IRQ_STATUS_6X, buf, 2);
+  return ((uint16_t)buf[0] << 8) | buf[1];
+}
+
 void sx126x::clearIrqFlags() {
   uint8_t mask[2] = {0x03, 0xFF};
   executeOpcode(OP_CLEAR_IRQ_STATUS_6X, mask, 2);
@@ -671,7 +677,16 @@ void sx126x::onReceive(void(*callback)(int)){
     #if defined(SPI_HAS_NOTUSINGINTERRUPT) || MCU_VARIANT == MCU_RP2040
       SPI.usingInterrupt(digitalPinToInterrupt(_dio0));
     #endif
-    attachInterrupt(digitalPinToInterrupt(_dio0), sx126x::onDio0Rise, RISING);
+    #if MCU_VARIANT == MCU_RP2040
+      // DIO1 is level-held by the SX1262 until its IRQ flags are cleared.
+      // With an edge trigger, a rising edge that lands inside an
+      // interrupt-masked SPI transaction window is lost forever — the
+      // line just stays high — permanently killing packet delivery.
+      // A level trigger re-fires as soon as the mask window ends.
+      attachInterrupt(digitalPinToInterrupt(_dio0), sx126x::onDio0Rise, HIGH);
+    #else
+      attachInterrupt(digitalPinToInterrupt(_dio0), sx126x::onDio0Rise, RISING);
+    #endif
 
   } else {
     detachInterrupt(digitalPinToInterrupt(_dio0));
@@ -893,7 +908,14 @@ void ISR_VECT sx126x::handleDio0Rise() {
   executeOpcodeRead(OP_GET_IRQ_STATUS_6X, buf, 2);
   executeOpcode(OP_CLEAR_IRQ_STATUS_6X, buf, 2);
 
+  #if MCU_VARIANT == MCU_RP2040
+  // With the level-triggered attach, deliver only on an actual RX_DONE:
+  // a spurious trigger would otherwise re-deliver the previous packet
+  // from the modem buffer.
+  if ((buf[1] & IRQ_RX_DONE_MASK_6X) != 0 && (buf[1] & IRQ_PAYLOAD_CRC_ERROR_MASK_6X) == 0) {
+  #else
   if ((buf[1] & IRQ_PAYLOAD_CRC_ERROR_MASK_6X) == 0) {
+  #endif
     _packetIndex = 0;
     uint8_t rxbuf[2] = {0}; // Read packet length
     executeOpcodeRead(OP_RX_BUFFER_STATUS_6X, rxbuf, 2);

@@ -35,6 +35,7 @@ public:
   int packetRssi();
   int packetRssi(uint8_t pkt_snr_raw);
   uint8_t getOperatingMode();
+  uint16_t getIrqFlags();
   void clearIrqFlags();
   int currentRssi();
   uint8_t packetRssiRaw();
