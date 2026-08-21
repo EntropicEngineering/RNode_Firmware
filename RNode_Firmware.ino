@@ -1509,23 +1509,28 @@ void update_modem_status() {
 
       uint8_t om = LoRa->getOperatingMode();
 
-      // 0x7D: RP2040 diagnostic telemetry, 1 Hz. Emitted before any
-      // recovery action so the tape shows the pre-recovery state.
-      uint16_t irqf = LoRa->getIrqFlags();
-      uint8_t dbg_flags = (dcd ? 1 : 0) | (interference_detected ? 2 : 0)
-                        | (airtime_lock ? 4 : 0) | (queue_flushing ? 8 : 0);
-      serial_write(FEND); serial_write(0x7D);
-      escaped_serial_write(om);
-      escaped_serial_write(irqf >> 8); escaped_serial_write(irqf & 0xFF);
-      escaped_serial_write(dbg_flags);
-      escaped_serial_write(radio_rx_lost);
-      escaped_serial_write(queue_height);
-      escaped_serial_write(queued_bytes >> 8); escaped_serial_write(queued_bytes & 0xFF);
-      escaped_serial_write(queue_cursor >> 8); escaped_serial_write(queue_cursor & 0xFF);
-      escaped_serial_write(current_packet_start >> 8); escaped_serial_write(current_packet_start & 0xFF);
-      escaped_serial_write((uint8_t)csma_cw);
-      escaped_serial_write((uint8_t)(noise_floor+rssi_offset));
-      serial_write(FEND);
+      #if defined(RNODE_RP2040_TELEMETRY)
+        // 0x7D: diagnostic telemetry, 1 Hz. Build with
+        // -DRNODE_RP2040_TELEMETRY to enable; used together with a
+        // KISS-level soak harness when investigating radio wedges.
+        // Emitted before any recovery action so the tape shows the
+        // pre-recovery state.
+        uint16_t irqf = LoRa->getIrqFlags();
+        uint8_t dbg_flags = (dcd ? 1 : 0) | (interference_detected ? 2 : 0)
+                          | (airtime_lock ? 4 : 0) | (queue_flushing ? 8 : 0);
+        serial_write(FEND); serial_write(0x7D);
+        escaped_serial_write(om);
+        escaped_serial_write(irqf >> 8); escaped_serial_write(irqf & 0xFF);
+        escaped_serial_write(dbg_flags);
+        escaped_serial_write(radio_rx_lost);
+        escaped_serial_write(queue_height);
+        escaped_serial_write(queued_bytes >> 8); escaped_serial_write(queued_bytes & 0xFF);
+        escaped_serial_write(queue_cursor >> 8); escaped_serial_write(queue_cursor & 0xFF);
+        escaped_serial_write(current_packet_start >> 8); escaped_serial_write(current_packet_start & 0xFF);
+        escaped_serial_write((uint8_t)csma_cw);
+        escaped_serial_write((uint8_t)(noise_floor+rssi_offset));
+        serial_write(FEND);
+      #endif
 
       if (om != 0x05 && om != 0x06) {  // neither RX nor TX
         radio_rx_lost++;
