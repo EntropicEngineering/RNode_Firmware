@@ -19,6 +19,11 @@ ARDUINO_ESP_CORE_VER = 2.0.17
 # Version 3.2.0 of the Arduino ESP core is based on ESP-IDF v5.4.1
 # ARDUINO_ESP_CORE_VER = 3.2.0
 
+# Audited RAK11300 toolchain dependencies. Keep these explicit so
+# `prep-rp2040` cannot silently move a production build to newer releases.
+ARDUINO_RP2040_CORE_VER = 6.0.0
+ARDUINO_CRYPTO_LIB_VER = 0.4.0
+
 all: release
 
 clean:
@@ -47,8 +52,8 @@ prep-samd:
 
 prep-rp2040:
 	arduino-cli core update-index --config-file arduino-cli.yaml
-	arduino-cli core install rp2040:rp2040 --config-file arduino-cli.yaml
-	arduino-cli lib install "Crypto"
+	arduino-cli core install rp2040:rp2040@$(ARDUINO_RP2040_CORE_VER) --config-file arduino-cli.yaml
+	arduino-cli lib install "Crypto@$(ARDUINO_CRYPTO_LIB_VER)"
 
 prep-nrf:
 	arduino-cli core update-index --config-file arduino-cli.yaml
