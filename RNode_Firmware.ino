@@ -1506,6 +1506,51 @@ void update_modem_status() {
 }
 
 #if MCU_VARIANT == MCU_RP2040
+  #define RP2040_DCD_STUCK_MIN_MS       30000UL
+  #define RP2040_DCD_AIRTIME_GUARD_MS   5000UL
+
+  // Maximum on-air time for one physical packet at the active modem
+  // settings. The sentinel starts timing at carrier detection, so use the
+  // longest form (255-byte payload, explicit header and CRC) even when the
+  // current host packet is shorter or uses implicit mode.
+  uint32_t rp2040_max_packet_airtime_ms() {
+    if (lora_bw == 0 || lora_sf < 5 || lora_sf > 12) {
+      return RP2040_DCD_STUCK_MIN_MS;
+    }
+
+    uint32_t sf = (uint32_t)lora_sf;
+    uint32_t cr = (lora_cr < 5) ? 5u : ((lora_cr > 8) ? 8u : (uint32_t)lora_cr);
+    uint32_t ldr_opt = lora_low_datarate ? 1u : 0u;
+    uint32_t preamble = lora_preamble_symbols > 0
+                      ? (uint32_t)lora_preamble_symbols
+                      : LORA_PREAMBLE_SYMBOLS_MIN;
+
+    // Semtech LoRa airtime formula. lora_cr is the coding-rate denominator
+    // (5..8), which is also the payload-symbol multiplier after ceiling.
+    uint32_t payload_numerator = 8u*SINGLE_MTU - 4u*sf
+                               + 8u + PHY_HEADER_LORA_SYMBOLS
+                               + PHY_CRC_LORA_BITS;
+    uint32_t payload_denominator = 4u*(sf - 2u*ldr_opt);
+    uint32_t payload_groups = (payload_numerator + payload_denominator - 1u)
+                            / payload_denominator;
+    uint32_t payload_symbols = 8u + payload_groups*cr;
+
+    // Work in quarter-symbols so the 4.25-symbol LoRa preamble tail remains
+    // exact, then round the final duration up to a whole millisecond.
+    uint32_t quarter_symbols = 4u*(preamble + payload_symbols) + 17u;
+    uint64_t scaled_us = (uint64_t)quarter_symbols * (1u << sf) * 1000000ULL;
+    uint64_t divisor = 4ULL*(uint64_t)lora_bw;
+    uint64_t airtime_us = (scaled_us + divisor - 1ULL) / divisor;
+    return (uint32_t)((airtime_us + 999ULL) / 1000ULL);
+  }
+
+  uint32_t rp2040_dcd_stuck_timeout_ms() {
+    uint32_t timeout_ms = rp2040_max_packet_airtime_ms()
+                        + RP2040_DCD_AIRTIME_GUARD_MS;
+    return timeout_ms < RP2040_DCD_STUCK_MIN_MS
+         ? RP2040_DCD_STUCK_MIN_MS : timeout_ms;
+  }
+
   // Radio health sentinel. The SX1262 has been observed to lose its
   // level-held DIO1 interrupt and silently stop delivering packets,
   // with latched carrier-detect then blocking CSMA transmission — all
@@ -1551,12 +1596,11 @@ void update_modem_status() {
         else if (radio_rx_lost >= 2) { LoRa->clearIrqFlags(); lora_receive(); }
       } else { radio_rx_lost = 0; }
 
-      if (dcd) {
+      if (dcd && om == 0x05) {  // only time carrier detect while receiving
         if (dcd_high_since == 0) { dcd_high_since = millis(); }
-        else if (millis()-dcd_high_since > 30000) {
-          // No LoRa transmission lasts half a minute; a latched
-          // carrier-detect would block CSMA forever. Clear the modem's
-          // IRQ flags and re-arm receive.
+        else if (millis()-dcd_high_since > rp2040_dcd_stuck_timeout_ms()) {
+          // Carrier detect outlasted the longest valid packet at the active
+          // modem settings. Clear the latched IRQs and re-arm receive.
           LoRa->clearIrqFlags(); lora_receive(); dcd_high_since = 0;
         }
       } else { dcd_high_since = 0; }
