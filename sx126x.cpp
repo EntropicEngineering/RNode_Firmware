@@ -480,6 +480,11 @@ int sx126x::endPacket() {
     buf[0] = 0x00;
     buf[1] = 0x00;
     executeOpcodeRead(OP_GET_IRQ_STATUS_6X, buf, 2);
+    #if MCU_VARIANT == MCU_RP2040
+      // A valid low-rate LoRa frame can outlast the 8 s board watchdog.
+      // endPacket() is synchronous, so loop() cannot feed it while TX runs.
+      rp2040.wdt_reset();
+    #endif
     yield();
   }
 
