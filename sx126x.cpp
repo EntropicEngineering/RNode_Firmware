@@ -182,16 +182,15 @@ uint8_t ISR_VECT sx126x::singleTransfer(uint8_t opcode, uint16_t address, uint8_
   waitOnBusy();
   
   uint8_t response;
-  digitalWrite(_ss, LOW);
   SPI.beginTransaction(_spiSettings);
+  digitalWrite(_ss, LOW);
   SPI.transfer(opcode);
   SPI.transfer((address & 0xFF00) >> 8);
   SPI.transfer(address & 0x00FF);
   if (opcode == OP_READ_REGISTER_6X) { SPI.transfer(0x00); }
   response = SPI.transfer(value);
-  SPI.endTransaction();
-
   digitalWrite(_ss, HIGH);
+  SPI.endTransaction();
 
   return response;
 }
@@ -217,46 +216,46 @@ void sx126x::waitOnBusy() {
 
 void sx126x::executeOpcode(uint8_t opcode, uint8_t *buffer, uint8_t size) {
   waitOnBusy();
-  digitalWrite(_ss, LOW);
   SPI.beginTransaction(_spiSettings);
+  digitalWrite(_ss, LOW);
   SPI.transfer(opcode);
   for (int i = 0; i < size; i++) { SPI.transfer(buffer[i]); }
-  SPI.endTransaction();
   digitalWrite(_ss, HIGH);
+  SPI.endTransaction();
 }
 
 void sx126x::executeOpcodeRead(uint8_t opcode, uint8_t *buffer, uint8_t size) {
   waitOnBusy();
-  digitalWrite(_ss, LOW);
   SPI.beginTransaction(_spiSettings);
+  digitalWrite(_ss, LOW);
   SPI.transfer(opcode);
   SPI.transfer(0x00);
   for (int i = 0; i < size; i++) { buffer[i] = SPI.transfer(0x00); }
-  SPI.endTransaction();
   digitalWrite(_ss, HIGH);
+  SPI.endTransaction();
 }
 
 void sx126x::writeBuffer(const uint8_t* buffer, size_t size) {
   waitOnBusy();
-  digitalWrite(_ss, LOW);
   SPI.beginTransaction(_spiSettings);
+  digitalWrite(_ss, LOW);
   SPI.transfer(OP_FIFO_WRITE_6X);
   SPI.transfer(_fifo_tx_addr_ptr);
   for (int i = 0; i < size; i++) { SPI.transfer(buffer[i]); _fifo_tx_addr_ptr++; }
-  SPI.endTransaction();
   digitalWrite(_ss, HIGH);
+  SPI.endTransaction();
 }
 
 void sx126x::readBuffer(uint8_t* buffer, size_t size) {
   waitOnBusy();
-  digitalWrite(_ss, LOW);
   SPI.beginTransaction(_spiSettings);
+  digitalWrite(_ss, LOW);
   SPI.transfer(OP_FIFO_READ_6X);
   SPI.transfer(_fifo_rx_addr_ptr);
   SPI.transfer(0x00);
   for (int i = 0; i < size; i++) { buffer[i] = SPI.transfer(0x00); }
-  SPI.endTransaction();
   digitalWrite(_ss, HIGH);
+  SPI.endTransaction();
 }
 
 void sx126x::setModulationParams(uint8_t sf, uint8_t bw, uint8_t cr, int ldro) {
@@ -537,12 +536,12 @@ uint8_t sx126x::currentRssiRaw() {
 // 0x2 STBY_RC, 0x3 STBY_XOSC, 0x4 FS, 0x5 RX, 0x6 TX
 uint8_t sx126x::getOperatingMode() {
   waitOnBusy();
-  digitalWrite(_ss, LOW);
   SPI.beginTransaction(_spiSettings);
+  digitalWrite(_ss, LOW);
   SPI.transfer(OP_STATUS_6X);
   uint8_t status = SPI.transfer(0x00);
-  SPI.endTransaction();
   digitalWrite(_ss, HIGH);
+  SPI.endTransaction();
   return (status >> 4) & 0x07;
 }
 
