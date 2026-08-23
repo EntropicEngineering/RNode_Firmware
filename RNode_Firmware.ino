@@ -1561,6 +1561,8 @@ void update_modem_status() {
   void rp2040_radio_sentinel() {
     static uint32_t last_radio_check = 0;
     static uint8_t radio_rx_lost = 0;
+    static uint8_t invalid_rssi_gate = 0;
+    static bool invalid_rssi_recovery_attempted = false;
     static uint32_t dcd_high_since = 0;
     if (radio_online && millis()-last_radio_check >= 1000) {
       last_radio_check = millis();
@@ -1595,6 +1597,32 @@ void update_modem_status() {
         if (radio_rx_lost >= 6)      { stopRadio(); startRadio(); radio_rx_lost = 0; }
         else if (radio_rx_lost >= 2) { LoRa->clearIrqFlags(); lora_receive(); }
       } else { radio_rx_lost = 0; }
+
+      // A zero SX1262 GetRssiInst response maps to 0 dBm. With no carrier
+      // detected this is classified as interference, so medium_free() can
+      // otherwise hold a backed-up TX queue forever while the modem still
+      // reports RX mode.
+      // Recover only when that value is actively gating queued transmission;
+      // do not declare the channel free, since zero can also mean an
+      // exceptionally strong real signal. Re-arming and then resetting only
+      // the radio preserves the queued host frames.
+      bool invalid_rssi_blocks_tx = queue_height > 0 && !airtime_lock
+                                  && avoid_interference && interference_detected
+                                  && !dcd && current_rssi == 0 && om == 0x05;
+      if (invalid_rssi_blocks_tx) {
+        if (!invalid_rssi_recovery_attempted) {
+          invalid_rssi_gate++;
+          if (invalid_rssi_gate >= 6) {
+            stopRadio(); startRadio(); invalid_rssi_gate = 0;
+            invalid_rssi_recovery_attempted = true;
+          } else if (invalid_rssi_gate == 2) {
+            LoRa->clearIrqFlags(); lora_receive();
+          }
+        }
+      } else {
+        invalid_rssi_gate = 0;
+        invalid_rssi_recovery_attempted = false;
+      }
 
       if (dcd && om == 0x05) {  // only time carrier detect while receiving
         if (dcd_high_since == 0) { dcd_high_since = millis(); }
