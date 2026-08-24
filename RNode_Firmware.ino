@@ -1642,6 +1642,17 @@ void update_modem_status() {
 
       uint8_t om = LoRa->getOperatingMode();
 
+      // Keep the noise floor re-averaging even while the TX queue is backed
+      // up: its only other call site is check_modem_status()'s timed body,
+      // which starves in exactly that state (tx_queue_handler refreshes
+      // last_status_update every pass). Observed live: a floor calibrated
+      // during a concurrent host transmission (-36 dBm vs the real ~-100)
+      // asserted interference_detected, CSMA never cleared the queue, and
+      // the starved floor could never re-average — a permanent TX outage
+      // the 1 Hz resample here converts to a ~2 min self-heal
+      // (NOISE_FLOOR_SAMPLES=128).
+      update_noise_floor();
+
       #if defined(RNODE_RP2040_UART_HOST)
         // Forensics: sticky UART1 receive-status errors (OE/BE/PE/FE) mean
         // host bytes were damaged or lost on the wire side; count sightings
