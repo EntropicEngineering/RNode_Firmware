@@ -160,6 +160,11 @@ firmware-rak11300:
 firmware-rak11300-uarthost:
 	arduino-cli compile --log --fqbn rp2040:rp2040:rakwireless_rak11300 -e --build-property "compiler.cpp.extra_flags=\"-DBOARD_MODEL=0x52\" \"-DRNODE_RP2040_UART_HOST\""
 
+# Bench diagnostics build: UART host plus the 1 Hz 0x7D telemetry frame
+# (USB CDC only — the UART-host KISS stream stays byte-identical).
+firmware-rak11300-uarthost-telemetry:
+	arduino-cli compile --log --fqbn rp2040:rp2040:rakwireless_rak11300 -e --build-property "compiler.cpp.extra_flags=\"-DBOARD_MODEL=0x52\" \"-DRNODE_RP2040_UART_HOST\" \"-DRNODE_RP2040_TELEMETRY\""
+
 firmware-heltec_t114:
 	arduino-cli compile --log --fqbn Heltec_nRF52:Heltec_nRF52:HT-n5262 -e --build-property "build.partitions=no_ota" --build-property "upload.maximum_size=2097152" --build-property "compiler.cpp.extra_flags=\"-DBOARD_MODEL=0x3C\""
 

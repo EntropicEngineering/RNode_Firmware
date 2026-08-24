@@ -16,9 +16,36 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include "Utilities.h"
+#if MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
+  #include <hardware/uart.h>   // uart_get_hw(uart1) for RSR error forensics
+#endif
 
 FIFOBuffer serialFIFO;
 uint8_t serialBuffer[CONFIG_UART_BUFFER_SIZE+1];
+
+#if MCU_VARIANT == MCU_RP2040
+// Host-frame length forensics (cat bench, PLAUS-03 −7-byte truncation hunt):
+// per CMD_DATA frame from the host, record how many unescaped payload bytes
+// ARRIVED at serial_callback versus how many the packet queue ADMITTED, so a
+// truncation localizes to the serial wire (arrival short) or to queue
+// admission (arrival full, queued short). All updates run in loop() context
+// (same thread as the sentinel that reports them); reported over the 0x7D
+// telemetry frame when RNODE_RP2040_TELEMETRY is enabled.
+struct hostf_rec { uint8_t seq; uint16_t arrival; uint16_t queued; };
+volatile uint16_t hostf_frames = 0;         // CMD_DATA frames closed
+volatile uint16_t hostf_drop_bytes = 0;     // payload bytes refused by admission (saturating)
+uint16_t hostf_arrival_cur = 0;             // unescaped payload bytes seen this frame
+uint16_t hostf_cursor_at_open = 0;          // queue_cursor when this frame opened
+struct hostf_rec hostf_ring[4];
+uint8_t hostf_ring_at = 0;
+struct rftx_rec { uint8_t seq; uint16_t len; };
+volatile uint16_t rftx_frames = 0;          // RF transmissions started
+struct rftx_rec rftx_ring[4];
+uint8_t rftx_ring_at = 0;
+#if defined(RNODE_RP2040_UART_HOST)
+uint8_t uart1_err_events = 0;               // UART1 RSR OE/BE/PE/FE sightings (saturating)
+#endif
+#endif
 
 FIFOBuffer16 packet_starts;
 uint16_t packet_starts_buf[CONFIG_QUEUE_MAX_LENGTH+1];
@@ -773,6 +800,13 @@ void update_airtime() {
 }
 
 void transmit(uint16_t size) {
+  #if MCU_VARIANT == MCU_RP2040
+    // Forensics: RF payload length as handed to the modem (the queued
+    // packet length; the on-air frame adds the 1-byte RNode header).
+    rftx_frames++;
+    rftx_ring[rftx_ring_at] = { (uint8_t)rftx_frames, size };
+    rftx_ring_at = (rftx_ring_at + 1) % 4;
+  #endif
   if (radio_online) {
     if (!promisc) {
       uint16_t  written = 0;
@@ -825,6 +859,22 @@ void serial_callback(uint8_t sbyte) {
   if (IN_FRAME && sbyte == FEND && command == CMD_DATA) {
     IN_FRAME = false;
 
+    #if MCU_VARIANT == MCU_RP2040
+      // Forensics: bytes stored for this frame = cursor advance since open
+      // (counts partial admissions the close gates below would hide).
+      uint16_t hostf_stored = (uint16_t)((queue_cursor + CONFIG_QUEUE_SIZE
+                              - hostf_cursor_at_open) % CONFIG_QUEUE_SIZE);
+      hostf_frames++;
+      if (hostf_arrival_cur > hostf_stored) {
+        uint16_t d = hostf_arrival_cur - hostf_stored;
+        hostf_drop_bytes = (hostf_drop_bytes > 0xffff - d) ? 0xffff
+                                                           : hostf_drop_bytes + d;
+      }
+      hostf_ring[hostf_ring_at] = { (uint8_t)hostf_frames, hostf_arrival_cur,
+                                    hostf_stored };
+      hostf_ring_at = (hostf_ring_at + 1) % 4;
+    #endif
+
     if (!fifo16_isfull(&packet_starts) && queued_bytes < CONFIG_QUEUE_SIZE) {
         uint16_t s = current_packet_start;
         int16_t e = queue_cursor-1; if (e == -1) e = CONFIG_QUEUE_SIZE-1;
@@ -845,6 +895,10 @@ void serial_callback(uint8_t sbyte) {
     IN_FRAME = true;
     command = CMD_UNKNOWN;
     frame_len = 0;
+    #if MCU_VARIANT == MCU_RP2040
+      hostf_arrival_cur = 0;
+      hostf_cursor_at_open = queue_cursor;
+    #endif
   } else if (IN_FRAME && frame_len < MTU) {
     // Have a look at the command byte first
     if (frame_len == 0 && command == CMD_UNKNOWN) {
@@ -861,6 +915,9 @@ void serial_callback(uint8_t sbyte) {
                 if (sbyte == TFESC) sbyte = FESC;
                 ESCAPE = false;
             }
+            #if MCU_VARIANT == MCU_RP2040
+              hostf_arrival_cur++;   // forensics: payload byte arrived (pre-admission)
+            #endif
             if (queue_height < CONFIG_QUEUE_MAX_LENGTH && queued_bytes < CONFIG_QUEUE_SIZE) {
               queued_bytes++;
               packet_queue[queue_cursor++] = sbyte;
@@ -1558,6 +1615,22 @@ void update_modem_status() {
   // loop() directly: it must NOT live inside check_modem_status()'s
   // timed body, which starves whenever a backed-up TX queue makes
   // tx_queue_handler() poll update_modem_status() every pass.
+  #if defined(RNODE_RP2040_TELEMETRY)
+    // Telemetry goes to the USB CDC ONLY: a passive bench listener reads it
+    // there, and the UART-host KISS stream stays byte-identical with the
+    // telemetry build so it is soak-transparent (the system controller
+    // would otherwise forward 0x7D frames upstream as liveness noise).
+    void telem_write(uint8_t byte) { Serial.write(byte); }
+    void escaped_telem_write(uint8_t byte) {
+      if (byte == FEND) { telem_write(FESC); byte = TFEND; }
+      if (byte == FESC) { telem_write(FESC); byte = TFESC; }
+      telem_write(byte);
+    }
+    void escaped_telem_write16(uint16_t v) {
+      escaped_telem_write(v >> 8); escaped_telem_write(v & 0xFF);
+    }
+  #endif
+
   void rp2040_radio_sentinel() {
     static uint32_t last_radio_check = 0;
     static uint8_t radio_rx_lost = 0;
@@ -1569,8 +1642,19 @@ void update_modem_status() {
 
       uint8_t om = LoRa->getOperatingMode();
 
+      #if defined(RNODE_RP2040_UART_HOST)
+        // Forensics: sticky UART1 receive-status errors (OE/BE/PE/FE) mean
+        // host bytes were damaged or lost on the wire side; count sightings
+        // and clear. (uart1 is the Serial2 peripheral on GPIO4/5.)
+        uint32_t rsr = uart_get_hw(uart1)->rsr;
+        if (rsr & 0xf) {
+          if (uart1_err_events < 0xff) uart1_err_events++;
+          uart_get_hw(uart1)->rsr = 0xf;
+        }
+      #endif
+
       #if defined(RNODE_RP2040_TELEMETRY)
-        // 0x7D: diagnostic telemetry, 1 Hz. Build with
+        // 0x7D: diagnostic telemetry, 1 Hz, USB CDC only. Build with
         // -DRNODE_RP2040_TELEMETRY to enable; used together with a
         // KISS-level soak harness when investigating radio wedges.
         // Emitted before any recovery action so the tape shows the
@@ -1578,18 +1662,36 @@ void update_modem_status() {
         uint16_t irqf = LoRa->getIrqFlags();
         uint8_t dbg_flags = (dcd ? 1 : 0) | (interference_detected ? 2 : 0)
                           | (airtime_lock ? 4 : 0) | (queue_flushing ? 8 : 0);
-        serial_write(FEND); serial_write(0x7D);
-        escaped_serial_write(om);
-        escaped_serial_write(irqf >> 8); escaped_serial_write(irqf & 0xFF);
-        escaped_serial_write(dbg_flags);
-        escaped_serial_write(radio_rx_lost);
-        escaped_serial_write(queue_height);
-        escaped_serial_write(queued_bytes >> 8); escaped_serial_write(queued_bytes & 0xFF);
-        escaped_serial_write(queue_cursor >> 8); escaped_serial_write(queue_cursor & 0xFF);
-        escaped_serial_write(current_packet_start >> 8); escaped_serial_write(current_packet_start & 0xFF);
-        escaped_serial_write((uint8_t)csma_cw);
-        escaped_serial_write((uint8_t)(noise_floor+rssi_offset));
-        serial_write(FEND);
+        telem_write(FEND); telem_write(0x7D);
+        escaped_telem_write(om);
+        escaped_telem_write(irqf >> 8); escaped_telem_write(irqf & 0xFF);
+        escaped_telem_write(dbg_flags);
+        escaped_telem_write(radio_rx_lost);
+        escaped_telem_write(queue_height);
+        escaped_telem_write16(queued_bytes);
+        escaped_telem_write16(queue_cursor);
+        escaped_telem_write16(current_packet_start);
+        escaped_telem_write((uint8_t)csma_cw);
+        escaped_telem_write((uint8_t)(noise_floor+rssi_offset));
+        // Host-frame / RF-TX length forensics (PLAUS-03 truncation hunt).
+        escaped_telem_write16(hostf_frames);
+        escaped_telem_write16(hostf_drop_bytes);
+        #if defined(RNODE_RP2040_UART_HOST)
+          escaped_telem_write(uart1_err_events);
+        #else
+          escaped_telem_write(0);
+        #endif
+        for (uint8_t i = 0; i < 4; i++) {
+          escaped_telem_write(hostf_ring[i].seq);
+          escaped_telem_write16(hostf_ring[i].arrival);
+          escaped_telem_write16(hostf_ring[i].queued);
+        }
+        escaped_telem_write16(rftx_frames);
+        for (uint8_t i = 0; i < 4; i++) {
+          escaped_telem_write(rftx_ring[i].seq);
+          escaped_telem_write16(rftx_ring[i].len);
+        }
+        telem_write(FEND);
       #endif
 
       if (om != 0x05 && om != 0x06) {  // neither RX nor TX
