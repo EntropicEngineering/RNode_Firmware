@@ -44,6 +44,24 @@ struct rftx_rec rftx_ring[4];
 uint8_t rftx_ring_at = 0;
 #if defined(RNODE_RP2040_UART_HOST)
 uint8_t uart1_err_events = 0;               // UART1 RSR OE/BE/PE/FE sightings (saturating)
+// KISS integrity trailer (PLAUS-03 fix): the system controller appends
+// CRC16-CCITT over the unescaped CMD_DATA payload; the serial hop to this
+// RP2040 loses bytes at the UART receiver during blocked windows (proven
+// live), so a damaged frame must be DROPPED here — a counted clean loss
+// the sending stack retries — never transmitted as a valid packet. The
+// last two unescaped bytes ride a lag buffer so the trailer never enters
+// the packet queue.
+uint16_t hostcrc_calc = 0xffff;             // CRC over lag-exited payload bytes
+uint8_t  hostcrc_lag[2];                    // last two unescaped bytes (the trailer)
+uint8_t  hostcrc_lagn = 0;
+uint16_t hostcrc_drops = 0;                 // frames dropped on CRC/runt (saturating)
+uint16_t hostcrc_last_fail_len = 0;         // payload length of the last dropped frame
+
+static inline uint16_t hostcrc_step(uint16_t crc, uint8_t b) {
+  crc ^= (uint16_t)b << 8;
+  for (uint8_t i = 0; i < 8; i++) crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
+  return crc;
+}
 #endif
 #endif
 
@@ -875,6 +893,22 @@ void serial_callback(uint8_t sbyte) {
       hostf_ring_at = (hostf_ring_at + 1) % 4;
     #endif
 
+    #if MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
+      // Validate the CRC16 trailer the system controller appended. A runt
+      // (no full trailer) or mismatch means the serial hop damaged the
+      // frame: rewind the ring and drop it — the sending stack sees a
+      // clean loss and retries — instead of transmitting a corrupt packet.
+      uint16_t hostcrc_want = ((uint16_t)hostcrc_lag[0] << 8) | hostcrc_lag[1];
+      if (hostcrc_lagn < 2 || hostcrc_calc != hostcrc_want) {
+        if (hostcrc_drops < 0xffff) hostcrc_drops++;
+        hostcrc_last_fail_len = hostf_arrival_cur;
+        queue_cursor = hostf_cursor_at_open;
+        queued_bytes = (queued_bytes >= hostf_stored)
+                       ? queued_bytes - hostf_stored : 0;
+        return;
+      }
+    #endif
+
     if (!fifo16_isfull(&packet_starts) && queued_bytes < CONFIG_QUEUE_SIZE) {
         uint16_t s = current_packet_start;
         int16_t e = queue_cursor-1; if (e == -1) e = CONFIG_QUEUE_SIZE-1;
@@ -898,6 +932,10 @@ void serial_callback(uint8_t sbyte) {
     #if MCU_VARIANT == MCU_RP2040
       hostf_arrival_cur = 0;
       hostf_cursor_at_open = queue_cursor;
+      #if defined(RNODE_RP2040_UART_HOST)
+        hostcrc_calc = 0xffff;
+        hostcrc_lagn = 0;
+      #endif
     #endif
   } else if (IN_FRAME && frame_len < MTU) {
     // Have a look at the command byte first
@@ -915,6 +953,21 @@ void serial_callback(uint8_t sbyte) {
                 if (sbyte == TFESC) sbyte = FESC;
                 ESCAPE = false;
             }
+            #if MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
+              // Two-byte lag: admit a payload byte only once two newer
+              // unescaped bytes exist behind it, so the frame's trailing
+              // CRC16 never enters the packet queue.
+              if (hostcrc_lagn < 2) {
+                hostcrc_lag[hostcrc_lagn++] = sbyte;
+                sbyte = 0; goto data_byte_done;   // nothing to admit yet
+              } else {
+                uint8_t admit = hostcrc_lag[0];
+                hostcrc_lag[0] = hostcrc_lag[1];
+                hostcrc_lag[1] = sbyte;
+                hostcrc_calc = hostcrc_step(hostcrc_calc, admit);
+                sbyte = admit;
+              }
+            #endif
             #if MCU_VARIANT == MCU_RP2040
               hostf_arrival_cur++;   // forensics: payload byte arrived (pre-admission)
             #endif
@@ -923,6 +976,9 @@ void serial_callback(uint8_t sbyte) {
               packet_queue[queue_cursor++] = sbyte;
               if (queue_cursor == CONFIG_QUEUE_SIZE) queue_cursor = 0;
             }
+            #if MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
+              data_byte_done: ;
+            #endif
         }
     } else if (command == CMD_FREQUENCY) {
       if (sbyte == FESC) {
@@ -1702,6 +1758,12 @@ void update_modem_status() {
           escaped_telem_write(rftx_ring[i].seq);
           escaped_telem_write16(rftx_ring[i].len);
         }
+        #if defined(RNODE_RP2040_UART_HOST)
+          escaped_telem_write16(hostcrc_drops);
+          escaped_telem_write16(hostcrc_last_fail_len);
+        #else
+          escaped_telem_write16(0); escaped_telem_write16(0);
+        #endif
         telem_write(FEND);
       #endif
 
