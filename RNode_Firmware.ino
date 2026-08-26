@@ -17,6 +17,7 @@
 #include <SPI.h>
 #include "Utilities.h"
 #if MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
+  #include <hardware/irq.h>    // UART1 priority over the long radio GPIO ISR
   #include <hardware/uart.h>   // uart_get_hw(uart1) for RSR error forensics
 #endif
 
@@ -199,6 +200,11 @@ void setup() {
     Serial2.setRX(5);
     Serial2.setFIFOSize(CONFIG_UART_BUFFER_SIZE);
     Serial2.begin(serial_baudrate);
+    // The SX1262 DIO1 callback reads a complete RF packet over SPI and can
+    // occupy the default-priority GPIO IRQ longer than UART1's 32-byte
+    // hardware FIFO. Let the short UART drain IRQ preempt that callback;
+    // bytes then wait safely in Serial2's CONFIG_UART_BUFFER_SIZE ring.
+    irq_set_priority(UART1_IRQ, PICO_HIGHEST_IRQ_PRIORITY);
     // Keep RX idle-high when the far side is unpowered or tri-stated.
     gpio_set_pulls(5, true, false);
   #endif
@@ -1568,10 +1574,12 @@ void update_modem_status() {
     portENTER_CRITICAL(&update_lock);
   #elif MCU_VARIANT == MCU_NRF52
     portENTER_CRITICAL();
-  #elif MCU_VARIANT == MCU_RP2040
-    noInterrupts();
   #endif
 
+  // On RP2040, SPI.usingInterrupt(pin_dio) already masks only the SX1262
+  // DIO1 source around each SPI transaction. Do not globally mask IRQs here:
+  // waitOnBusy() may take milliseconds, long enough to overrun UART1's small
+  // hardware FIFO even though its 6 KiB software receive ring has room.
   bool carrier_detected = LoRa->dcd();
   current_rssi = LoRa->currentRssi();
   last_status_update = millis();
@@ -1580,8 +1588,6 @@ void update_modem_status() {
     portEXIT_CRITICAL(&update_lock);
   #elif MCU_VARIANT == MCU_NRF52
     portEXIT_CRITICAL();
-  #elif MCU_VARIANT == MCU_RP2040
-    interrupts();
   #endif
 
   #if BOARD_MODEL == BOARD_HELTEC32_V4
@@ -1689,24 +1695,36 @@ void update_modem_status() {
 
   void rp2040_radio_sentinel() {
     static uint32_t last_radio_check = 0;
+    static uint32_t last_noise_floor_sample = 0;
     static uint8_t radio_rx_lost = 0;
     static uint8_t invalid_rssi_gate = 0;
     static bool invalid_rssi_recovery_attempted = false;
     static uint32_t dcd_high_since = 0;
+
+    // A host frame can arrive before a newly powered radio has established
+    // its 128-sample noise floor. Once that frame is queued, medium_free()
+    // polls update_modem_status() every pass and keeps resetting
+    // last_status_update, starving check_modem_status()'s normal sampler.
+    // Restore the normal status-cadence sampling only while interference is
+    // gating queued TX. This neither declares the medium free nor touches the
+    // queue, so the existing CSMA decision remains authoritative.
+    bool queued_interference_blocks_tx = radio_online && queue_height > 0
+                                       && !airtime_lock && avoid_interference
+                                       && interference_detected && !dcd;
+    if (queued_interference_blocks_tx
+        && millis()-last_noise_floor_sample >= status_interval_ms) {
+      last_noise_floor_sample = millis();
+      update_noise_floor();
+    }
+
     if (radio_online && millis()-last_radio_check >= 1000) {
       last_radio_check = millis();
 
       uint8_t om = LoRa->getOperatingMode();
 
-      // Keep the noise floor re-averaging even while the TX queue is backed
-      // up: its only other call site is check_modem_status()'s timed body,
-      // which starves in exactly that state (tx_queue_handler refreshes
-      // last_status_update every pass). Observed live: a floor calibrated
-      // during a concurrent host transmission (-36 dBm vs the real ~-100)
-      // asserted interference_detected, CSMA never cleared the queue, and
-      // the starved floor could never re-average — a permanent TX outage
-      // the 1 Hz resample here converts to a ~2 min self-heal
-      // (NOISE_FLOOR_SAMPLES=128).
+      // Keep a 1 Hz fallback sample for other states that can starve
+      // check_modem_status(); the queued-interference path above normally
+      // re-averages at status cadence instead.
       update_noise_floor();
 
       #if defined(RNODE_RP2040_UART_HOST)

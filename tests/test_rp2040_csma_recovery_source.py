@@ -38,6 +38,37 @@ class Rp2040CsmaRecoverySourceTest(unittest.TestCase):
         self.assertRegex(self.current_rssi, r"rssi\s*=\s*-\(int\(byte\)\)\s*/\s*2")
         self.assertIn("interference_detected", self.medium_free)
 
+    def test_backed_up_interference_resamples_at_status_cadence(self) -> None:
+        compact = re.sub(r"\s+", " ", self.sentinel)
+        fast_path = compact[compact.index("bool queued_interference_blocks_tx") :]
+        fast_path = fast_path[: fast_path.index(
+            "if (radio_online && millis()-last_radio_check >= 1000)"
+        )]
+
+        required_gate_terms = (
+            "radio_online",
+            "queue_height > 0",
+            "!airtime_lock",
+            "avoid_interference",
+            "interference_detected",
+            "!dcd",
+        )
+        for term in required_gate_terms:
+            self.assertIn(term, fast_path)
+
+        self.assertIn(
+            "millis()-last_noise_floor_sample >= status_interval_ms",
+            fast_path,
+        )
+        self.assertIn("update_noise_floor();", fast_path)
+
+        # Recovery must only improve sampling; CSMA and the queue stay in
+        # control of whether and when any frame is transmitted.
+        self.assertNotIn("flush_queue", fast_path)
+        self.assertNotIn("pop_queue", fast_path)
+        self.assertNotIn("interference_detected = false", fast_path)
+        self.assertNotIn("dcd = false", fast_path)
+
     def test_backed_up_zero_rssi_gate_has_bounded_recovery(self) -> None:
         compact = re.sub(r"\s+", " ", self.sentinel)
         required_gate_terms = (
