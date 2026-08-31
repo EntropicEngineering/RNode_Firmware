@@ -935,6 +935,12 @@
       #define EEPROM_SIZE 296
       #define EEPROM_OFFSET EEPROM_SIZE-EEPROM_RESERVED
 
+      // The SX1262 PA draws ~118 mA at its full +22 dBm; the global
+      // OCP_TUNED fallback (0x28 = 100 mA) current-limits the PA and
+      // clips output below full power. Use the SX1262 datasheet
+      // default for the high-power PA (0x38 = 140 mA).
+      #define OCP_TUNED 0x38
+
       // Following pins are for the sx1262
       const int pin_rxen = 25;      // antenna switch power (module ANT_PWR)
       const int pin_txen = -1;
