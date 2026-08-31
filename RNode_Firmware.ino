@@ -17,12 +17,25 @@
 #include <SPI.h>
 #include "Utilities.h"
 #if MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
-  #include <hardware/irq.h>    // UART1 priority over the long radio GPIO ISR
-  #include <hardware/uart.h>   // uart_get_hw(uart1) for RSR error forensics
+  #include <hardware/dma.h>
+  #include <hardware/irq.h>
+  #include <hardware/regs/uart.h>
+  #include <hardware/sync.h>
+  #include <hardware/uart.h>
 #endif
 
 FIFOBuffer serialFIFO;
 uint8_t serialBuffer[CONFIG_UART_BUFFER_SIZE+1];
+FIFOBuffer16 packet_starts;
+uint16_t packet_starts_buf[CONFIG_QUEUE_MAX_LENGTH+1];
+FIFOBuffer16 packet_lengths;
+uint16_t packet_lengths_buf[CONFIG_QUEUE_MAX_LENGTH+1];
+uint8_t packet_queue[CONFIG_QUEUE_SIZE];
+volatile uint8_t queue_height = 0;
+volatile uint16_t queued_bytes = 0;
+volatile uint16_t queue_cursor = 0;
+volatile uint16_t current_packet_start = 0;
+volatile bool serial_buffering = false;
 
 #if MCU_VARIANT == MCU_RP2040
 // Host-frame length forensics (cat bench, PLAUS-03 −7-byte truncation hunt):
@@ -45,6 +58,22 @@ struct rftx_rec rftx_ring[4];
 uint8_t rftx_ring_at = 0;
 #if defined(RNODE_RP2040_UART_HOST)
 uint8_t uart1_err_events = 0;               // UART1 RSR OE/BE/PE/FE sightings (saturating)
+// DMA reads the complete 12-bit PL011 DR value, not just its data byte, so
+// receive errors are handled in stream order. Two finite channels alternate:
+// RP2040 has no endless/self-trigger transfer-count mode.
+static const uint32_t UART1_DMA_RING_WORDS = 8192;
+static const uint32_t UART1_DMA_RING_MASK = UART1_DMA_RING_WORDS-1;
+static const uint32_t UART1_DMA_RING_BYTES = UART1_DMA_RING_WORDS*sizeof(uint16_t);
+static const uint32_t UART1_DMA_BLOCK_WORDS = UART1_DMA_RING_WORDS*16;
+alignas(UART1_DMA_RING_BYTES) static uint16_t uart1_dma_ring[UART1_DMA_RING_WORDS];
+static int uart1_dma_channel_a = -1;
+static int uart1_dma_channel_b = -1;
+static volatile int uart1_dma_active_channel = -1;
+static volatile uint64_t uart1_dma_completed_words = 0;
+static uint64_t uart1_dma_consumer = 0;
+static bool uart1_dma_reserved = false;
+static bool uart1_dma_ready = false;
+static bool uart1_dma_resync = false;
 // KISS integrity trailer (PLAUS-03 fix): the system controller appends
 // CRC16-CCITT over the unescaped CMD_DATA payload; the serial hop to this
 // RP2040 loses bytes at the UART receiver during blocked windows (proven
@@ -63,22 +92,154 @@ static inline uint16_t hostcrc_step(uint16_t crc, uint8_t b) {
   for (uint8_t i = 0; i < 8; i++) crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
   return crc;
 }
+
+static bool uart1_dma_claim_channels() {
+  uart1_dma_channel_a = dma_claim_unused_channel(false);
+  if (uart1_dma_channel_a < 0) return false;
+  uart1_dma_channel_b = dma_claim_unused_channel(false);
+  if (uart1_dma_channel_b < 0) {
+    dma_channel_unclaim((uint)uart1_dma_channel_a);
+    uart1_dma_channel_a = -1;
+    return false;
+  }
+  return true;
+}
+
+static void uart1_dma_rearm_completed(int completed, int next) {
+  dma_channel_acknowledge_irq0((uint)completed);
+  uart1_dma_completed_words += UART1_DMA_BLOCK_WORDS;
+  uart1_dma_active_channel = next;
+  // The peer is already receiving. Re-arm this inactive channel before the
+  // peer's >11 s saturated-wire block completes.
+  dma_channel_set_write_addr((uint)completed, uart1_dma_ring, false);
+  dma_channel_set_trans_count((uint)completed, UART1_DMA_BLOCK_WORDS, false);
+}
+
+static void uart1_dma_irq_handler() {
+  uint32_t pending = dma_hw->ints0;
+  if (pending & (1u << uart1_dma_channel_a)) {
+    uart1_dma_rearm_completed(uart1_dma_channel_a, uart1_dma_channel_b);
+  }
+  if (pending & (1u << uart1_dma_channel_b)) {
+    uart1_dma_rearm_completed(uart1_dma_channel_b, uart1_dma_channel_a);
+  }
+}
+
+static void uart1_dma_start() {
+  dma_channel_config cfg_a = dma_channel_get_default_config((uint)uart1_dma_channel_a);
+  channel_config_set_transfer_data_size(&cfg_a, DMA_SIZE_16);
+  channel_config_set_read_increment(&cfg_a, false);
+  channel_config_set_write_increment(&cfg_a, true);
+  channel_config_set_dreq(&cfg_a, uart_get_dreq(uart1, false));
+  channel_config_set_ring(&cfg_a, true, 14); // 2^14 bytes == 8192 DR halfwords
+  channel_config_set_high_priority(&cfg_a, true);
+  channel_config_set_chain_to(&cfg_a, (uint)uart1_dma_channel_b);
+
+  dma_channel_config cfg_b = dma_channel_get_default_config((uint)uart1_dma_channel_b);
+  channel_config_set_transfer_data_size(&cfg_b, DMA_SIZE_16);
+  channel_config_set_read_increment(&cfg_b, false);
+  channel_config_set_write_increment(&cfg_b, true);
+  channel_config_set_dreq(&cfg_b, uart_get_dreq(uart1, false));
+  channel_config_set_ring(&cfg_b, true, 14);
+  channel_config_set_high_priority(&cfg_b, true);
+  channel_config_set_chain_to(&cfg_b, (uint)uart1_dma_channel_a);
+
+  dma_channel_configure((uint)uart1_dma_channel_a, &cfg_a, uart1_dma_ring,
+                        &uart_get_hw(uart1)->dr, UART1_DMA_BLOCK_WORDS, false);
+  dma_channel_configure((uint)uart1_dma_channel_b, &cfg_b, uart1_dma_ring,
+                        &uart_get_hw(uart1)->dr, UART1_DMA_BLOCK_WORDS, false);
+  dma_hw->ints0 = (1u << uart1_dma_channel_a) | (1u << uart1_dma_channel_b);
+  dma_channel_set_irq0_enabled((uint)uart1_dma_channel_a, true);
+  dma_channel_set_irq0_enabled((uint)uart1_dma_channel_b, true);
+  irq_add_shared_handler(DMA_IRQ_0, uart1_dma_irq_handler,
+                         PICO_SHARED_IRQ_HANDLER_HIGHEST_ORDER_PRIORITY);
+  irq_set_enabled(DMA_IRQ_0, true);
+  uart1_dma_active_channel = uart1_dma_channel_a;
+  uart1_dma_ready = true;
+  dma_channel_start((uint)uart1_dma_channel_a);
+}
+
+static uint64_t uart1_dma_producer_snapshot() {
+  uint32_t irq_state = save_and_disable_interrupts();
+  uint64_t completed = uart1_dma_completed_words;
+  int active = uart1_dma_active_channel;
+  uint32_t remaining = dma_channel_hw_addr((uint)active)->transfer_count;
+  if (remaining > UART1_DMA_BLOCK_WORDS) remaining = UART1_DMA_BLOCK_WORDS;
+  uint64_t producer = completed + UART1_DMA_BLOCK_WORDS - remaining;
+  restore_interrupts(irq_state);
+  return producer;
+}
+
+static void uart1_dma_abort_frame() {
+  if (IN_FRAME && command == CMD_DATA) {
+    uint16_t stored = (uint16_t)((queue_cursor + CONFIG_QUEUE_SIZE
+                                 - hostf_cursor_at_open) % CONFIG_QUEUE_SIZE);
+    hostf_frames++;
+    hostf_ring[hostf_ring_at] = { (uint8_t)hostf_frames, hostf_arrival_cur,
+                                  stored };
+    hostf_ring_at = (hostf_ring_at + 1) % 4;
+    if (hostcrc_drops < 0xffff) hostcrc_drops++;
+    hostcrc_last_fail_len = hostf_arrival_cur;
+    queue_cursor = hostf_cursor_at_open;
+    current_packet_start = queue_cursor;
+    queued_bytes = (queued_bytes >= stored) ? queued_bytes-stored : 0;
+  }
+  IN_FRAME = false;
+  ESCAPE = false;
+  command = CMD_UNKNOWN;
+  frame_len = 0;
+  hostf_arrival_cur = 0;
+  hostcrc_calc = 0xffff;
+  hostcrc_lagn = 0;
+}
+
+static bool uart1_host_available() {
+  if (!uart1_dma_ready) return Serial2.available();
+  return uart1_dma_producer_snapshot() != uart1_dma_consumer;
+}
+
+// -1 means no byte was available; -2 means a damaged/resync byte was
+// deliberately consumed.  An OE-only DR word retains a valid current byte
+// (the lost byte preceded it), so it may still supply the boundary FEND.
+static int uart1_host_read() {
+  if (!uart1_dma_ready) return Serial2.read();
+  uint64_t producer = uart1_dma_producer_snapshot();
+  uint64_t available = producer-uart1_dma_consumer;
+  if (available == 0) return -1;
+  // A completely full circular buffer has no stable oldest slot: DMA may
+  // overwrite it immediately after this snapshot.  Retain one empty slot so
+  // every word we expose to the consumer remains owned by the consumer.
+  if (available >= UART1_DMA_RING_WORDS) {
+    uint64_t retained = UART1_DMA_RING_WORDS-1;
+    uart1_dma_consumer = producer-retained;
+    uart1_dma_abort_frame();
+    uart1_dma_resync = true;
+  }
+  __dmb();
+  uint16_t dr_word = uart1_dma_ring[uart1_dma_consumer & UART1_DMA_RING_MASK];
+  uart1_dma_consumer++;
+
+  uint16_t invalid = dr_word & (UART_UARTDR_FE_BITS | UART_UARTDR_PE_BITS |
+                                UART_UARTDR_BE_BITS);
+  uint8_t rsr = (uint8_t)((dr_word >> 8) & 0x0f);
+  if (rsr) {
+    if (uart1_err_events < 0xff) uart1_err_events++;
+    uart_get_hw(uart1)->rsr = 0x0f;
+    uart1_dma_abort_frame();
+    uart1_dma_resync = true;
+  }
+  if (invalid) return -2;
+
+  uint8_t data = (uint8_t)(dr_word & UART_UARTDR_DATA_BITS);
+  if (uart1_dma_resync) {
+    if (data != FEND) return -2;
+    uart1_dma_resync = false;
+  }
+  return data;
+}
 #endif
 #endif
 
-FIFOBuffer16 packet_starts;
-uint16_t packet_starts_buf[CONFIG_QUEUE_MAX_LENGTH+1];
-
-FIFOBuffer16 packet_lengths;
-uint16_t packet_lengths_buf[CONFIG_QUEUE_MAX_LENGTH+1];
-
-uint8_t packet_queue[CONFIG_QUEUE_SIZE];
-
-volatile uint8_t queue_height = 0;
-volatile uint16_t queued_bytes = 0;
-volatile uint16_t queue_cursor = 0;
-volatile uint16_t current_packet_start = 0;
-volatile bool serial_buffering = false;
 #if HAS_BLUETOOTH || HAS_BLE == true
   bool bt_init_ran = false;
 #endif
@@ -198,13 +359,24 @@ void setup() {
     // muxes UART1 TX to GPIO4/8 and RX to GPIO5/9 — so set the real pins.
     Serial2.setTX(4);
     Serial2.setRX(5);
-    Serial2.setFIFOSize(CONFIG_UART_BUFFER_SIZE);
+    uart1_dma_reserved = uart1_dma_claim_channels();
+    if (uart1_dma_reserved) Serial2.setPollingMode(true);
+    else Serial2.setFIFOSize(CONFIG_UART_BUFFER_SIZE);
     Serial2.begin(serial_baudrate);
-    // The SX1262 DIO1 callback reads a complete RF packet over SPI and can
-    // occupy the default-priority GPIO IRQ longer than UART1's 32-byte
-    // hardware FIFO. Let the short UART drain IRQ preempt that callback;
-    // bytes then wait safely in Serial2's CONFIG_UART_BUFFER_SIZE ring.
-    irq_set_priority(UART1_IRQ, PICO_HIGHEST_IRQ_PRIORITY);
+    if (uart1_dma_reserved) {
+      // DMA continues draining the 32-byte PL011 FIFO even while flash or a
+      // radio GPIO callback prevents CPU interrupt service. Keep error words
+      // flowing too; their DR status bits are classified by the consumer.
+      uart_set_irq_enables(uart1, false, false);
+      irq_set_enabled(UART1_IRQ, false);
+      hw_set_bits(&uart_get_hw(uart1)->dmacr, UART_UARTDMACR_RXDMAE_BITS);
+      hw_clear_bits(&uart_get_hw(uart1)->dmacr,
+                    UART_UARTDMACR_DMAONERR_BITS);
+      uart1_dma_start();
+    } else {
+      // Fail-operational fallback if both DMA channels cannot be reserved.
+      irq_set_priority(UART1_IRQ, PICO_HIGHEST_IRQ_PRIORITY);
+    }
     // Keep RX idle-high when the far side is unpowered or tri-stated.
     gpio_set_pulls(5, true, false);
   #endif
@@ -710,7 +882,11 @@ void flush_queue(void) {
   }
 
   queue_height = 0;
-  queued_bytes = 0;
+  // A later host frame can already be partially buffered behind the complete
+  // frames drained above. Keep those bytes accounted for until that frame
+  // closes; clearing them here can underflow a later rate-limited pop.
+  queued_bytes = (uint16_t)((queue_cursor + CONFIG_QUEUE_SIZE
+                             - current_packet_start) % CONFIG_QUEUE_SIZE);
 
   #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_RP2040
     update_airtime();
@@ -1728,13 +1904,14 @@ void update_modem_status() {
       update_noise_floor();
 
       #if defined(RNODE_RP2040_UART_HOST)
-        // Forensics: sticky UART1 receive-status errors (OE/BE/PE/FE) mean
-        // host bytes were damaged or lost on the wire side; count sightings
-        // and clear. (uart1 is the Serial2 peripheral on GPIO4/5.)
-        uint32_t rsr = uart_get_hw(uart1)->rsr;
-        if (rsr & 0xf) {
-          if (uart1_err_events < 0xff) uart1_err_events++;
-          uart_get_hw(uart1)->rsr = 0xf;
+        // The DMA path classifies each DR word exactly. Retain a sticky-RSR
+        // fallback only for the unlikely boot where no DMA pair was free.
+        if (!uart1_dma_ready) {
+          uint32_t rsr = uart_get_hw(uart1)->rsr;
+          if (rsr & 0xf) {
+            if (uart1_err_events < 0xff) uart1_err_events++;
+            uart_get_hw(uart1)->rsr = 0xf;
+          }
         }
       #endif
 
@@ -2300,7 +2477,7 @@ void buffer_serial() {
       #endif
       )
     #elif MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
-    while (c < MAX_CYCLES && (Serial.available() || Serial2.available()))
+    while (c < MAX_CYCLES && (Serial.available() || uart1_host_available()))
     #else
     while (c < MAX_CYCLES && Serial.available())
     #endif
@@ -2317,7 +2494,18 @@ void buffer_serial() {
         else                                     { if (!fifo_isfull(&serialFIFO)) { fifo_push(&serialFIFO, Serial.read()); } }
       #elif MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
         if (Serial.available()) { if (!fifo_isfull(&serialFIFO)) { fifo_push(&serialFIFO, Serial.read()); } }
-        else                    { if (!fifo_isfull(&serialFIFO)) { fifo_push(&serialFIFO, Serial2.read()); } }
+        else {
+          // Preserve the original single ordered KISS ingestion stream when
+          // provisioning USB and the Nordic UART are both attached.  DMA is
+          // the lossless UART front end; serialFIFO remains the parser queue.
+          // Drain its prefix before uart1_host_read() can signal an error and
+          // abort the current frame, keeping fault handling in stream order.
+          if (!fifo_isempty(&serialFIFO)) serial_poll();
+          if (!fifo_isfull(&serialFIFO)) {
+            int uart_byte = uart1_host_read();
+            if (uart_byte >= 0) fifo_push(&serialFIFO, (uint8_t)uart_byte);
+          }
+        }
       #else
         if (!fifo_isfull(&serialFIFO)) { fifo_push(&serialFIFO, Serial.read()); }
       #endif

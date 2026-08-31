@@ -132,6 +132,7 @@ private:
   uint8_t _cr;
   uint8_t _ldro;
   int _packetIndex;
+  int _rxPacketLength;
   int _preambleLength;
   int _implicitHeaderMode;
   int _payloadLength;

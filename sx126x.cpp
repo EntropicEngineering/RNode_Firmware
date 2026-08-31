@@ -125,6 +125,7 @@ sx126x::sx126x() :
   _cr(0x01),
   _ldro(0x00),
   _packetIndex(0),
+  _rxPacketLength(0),
   _preambleLength(18),
   _implicitHeaderMode(0),
   _payloadLength(255),
@@ -622,21 +623,11 @@ size_t sx126x::write(const uint8_t *buffer, size_t size) {
 }
 
 int ISR_VECT sx126x::available() {
-  uint8_t buf[2] = {0};
-  executeOpcodeRead(OP_RX_BUFFER_STATUS_6X, buf, 2);
-  return buf[0] - _packetIndex;
+  return _rxPacketLength - _packetIndex;
 }
 
 int ISR_VECT sx126x::read(){
   if (!available()) { return -1; }
-  if (_packetIndex == 0) {
-    uint8_t rxbuf[2] = {0};
-    executeOpcodeRead(OP_RX_BUFFER_STATUS_6X, rxbuf, 2);
-    int size = rxbuf[0];
-    _fifo_rx_addr_ptr = rxbuf[1];
-    readBuffer(_packet, size);
-  }
-
   uint8_t byte = _packet[_packetIndex];
   _packetIndex++;
   return byte;
@@ -644,16 +635,7 @@ int ISR_VECT sx126x::read(){
 
 int sx126x::peek() {
   if (!available()) { return -1; }
-  if (_packetIndex == 0) {
-      uint8_t rxbuf[2] = {0};
-      executeOpcodeRead(OP_RX_BUFFER_STATUS_6X, rxbuf, 2);
-      int size = rxbuf[0];
-      _fifo_rx_addr_ptr = rxbuf[1];
-      readBuffer(_packet, size);
-  }
-
-  uint8_t b = _packet[_packetIndex];
-  return b;
+  return _packet[_packetIndex];
 }
 
 void sx126x::flush() { }
@@ -923,8 +905,12 @@ void ISR_VECT sx126x::handleDio0Rise() {
     _packetIndex = 0;
     uint8_t rxbuf[2] = {0}; // Read packet length
     executeOpcodeRead(OP_RX_BUFFER_STATUS_6X, rxbuf, 2);
-    int packetLength = rxbuf[0];
-    if (_onReceive) { _onReceive(packetLength); }
+    _rxPacketLength = rxbuf[0];
+    _fifo_rx_addr_ptr = rxbuf[1];
+    // Cache the modem FIFO once. available()/read()/peek() are memory-only,
+    // avoiding one status-SPI transaction for every callback byte.
+    readBuffer(_packet, _rxPacketLength);
+    if (_onReceive) { _onReceive(_rxPacketLength); }
   }
 }
 

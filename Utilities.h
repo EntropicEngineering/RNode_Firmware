@@ -15,6 +15,10 @@
 
 #include "Config.h"
 
+#if MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
+  #include <hardware/uart.h>
+#endif
+
 #if HAS_EEPROM
     #include <EEPROM.h>
 #elif PLATFORM == PLATFORM_NRF52
@@ -854,7 +858,9 @@ void serial_write(uint8_t byte) {
 	#else
 		Serial.write(byte);
 		#if MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
-			Serial2.write(byte);
+			// SerialUART::write() pumps its RX FIFO in polling mode. UART1 RX
+			// belongs exclusively to DMA, so transmit directly through PL011.
+			uart_putc_raw(uart1, byte);
 		#endif
 	#endif
 }
