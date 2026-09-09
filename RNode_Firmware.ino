@@ -2213,7 +2213,10 @@ void tx_queue_handler() {
             else {                                                                // Wait time has passed, flush the queue
               bool should_flush = !lora_limit_rate && !lora_guard_rate;
               if (should_flush) { flush_queue(); } else { pop_queue(); }
-              cw_wait_passed = 0; csma_cw = -1; difs_wait_start = -1; }
+              // A new packet gets a new contention window. Keeping the old
+              // start counts TX/idle time toward that packet's random backoff.
+              cw_wait_passed = 0; cw_wait_start = -1;
+              csma_cw = -1; difs_wait_start = -1; }
           }
         }
       }
