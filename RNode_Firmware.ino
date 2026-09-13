@@ -17,6 +17,7 @@
 #include <SPI.h>
 #include "Utilities.h"
 #include "RadioFloor.h"
+#include "GameTurns.h"
 #if MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
   #include <hardware/dma.h>
   #include <hardware/irq.h>
@@ -284,6 +285,20 @@ static volatile uint32_t floor_queue_drops=0;
 static uint32_t floor_invalid=0, floor_replies=0, floor_blocked=0, floor_lease_ms=0;
 static bool floor_reported=false;
 static uint8_t floor_control[16];
+#endif
+
+#if RNODE_GAME_TURNS
+#if MCU_VARIANT != MCU_RP2040 || BOARD_MODEL != BOARD_RAK11300
+#error "Game turns currently support only RAK11300"
+#endif
+static cat_game_turns::State game_turns;
+static uint8_t turns_control[20];
+static uint32_t turns_rx_ms[MODEM_QUEUE_SIZE];
+static uint32_t turns_host_ms[CONFIG_QUEUE_MAX_LENGTH];
+static unsigned turns_host_head=0,turns_host_tail=0;
+static bool turns_configured=false; // After STOP, reject data until an explicit START.
+void turns_report();
+void turns_stop();
 #endif
 
 char sbuf[128];
@@ -637,6 +652,9 @@ inline void getPacketData(uint16_t len) {
 }
 
 void ISR_VECT receive_callback(int packet_size) {
+#if RNODE_GAME_TURNS
+  const uint32_t turns_received_at=millis();
+#endif
 #if RNODE_RADIO_FLOOR
   if (floor_config.role) {
     const uint32_t stamp=micros();
@@ -764,6 +782,9 @@ void ISR_VECT receive_callback(int packet_size) {
           modem_packet->snr_raw = LoRa->packetSnrRaw();
           modem_packet->rssi = LoRa->packetRssi(modem_packet->snr_raw);
           modem_packet->len = read_len;
+#if RNODE_GAME_TURNS
+          turns_rx_ms[modem_packet_tail]=turns_received_at;
+#endif
           memcpy(modem_packet->data, pbuf, read_len);
           modem_packet_tail = (uint8_t)((modem_packet_tail+1) % MODEM_QUEUE_SIZE);
         }
@@ -943,6 +964,11 @@ void pop_queue() {
 
       uint16_t start = fifo16_pop(&packet_starts);
       uint16_t length = fifo16_pop(&packet_lengths);
+#if RNODE_GAME_TURNS
+      const uint32_t residence=millis()-turns_host_ms[turns_host_tail];
+      turns_host_tail=(turns_host_tail+1)%CONFIG_QUEUE_MAX_LENGTH;
+      if(residence>game_turns.stats[6])game_turns.stats[6]=residence;
+#endif
       if (length >= MIN_L && length <= MTU) {
         for (uint16_t i = 0; i < length; i++) {
           uint16_t pos = (start+i)%CONFIG_QUEUE_SIZE;
@@ -1032,6 +1058,19 @@ void update_airtime() {
 }
 
 void transmit(uint16_t size) {
+#if RNODE_GAME_TURNS
+  cat_game_turns::Packet turn_packet;
+  if(turns_configured) {
+    const uint32_t cost=cat_game_turns::airtime_ms(size+1,lora_sf,lora_bw,lora_cr);
+    if(!cat_game_turns::packet(tbuf,size,turn_packet)||!game_turns.can_send(turn_packet,millis(),cost)) {
+      ++game_turns.stats[3];return;
+    }
+    if(game_turns.turns()&&game_turns.config.role==1) {
+      const uint32_t residence=millis()-game_turns.since;
+      if(residence>game_turns.stats[7])game_turns.stats[7]=residence;
+    }
+  }
+#endif
   #if MCU_VARIANT == MCU_RP2040
     // Forensics: RF payload length as handed to the modem (the queued
     // packet length; the on-air frame adds the 1-byte RNode header).
@@ -1085,6 +1124,9 @@ void transmit(uint16_t size) {
     }
 
   } else { kiss_indicate_error(ERROR_TXFAILED); led_indicate_error(5); }
+#if RNODE_GAME_TURNS
+  if(turns_configured&&game_turns.active)game_turns.transmitted(turn_packet,millis());
+#endif
 }
 
 #if RNODE_RADIO_FLOOR
@@ -1142,6 +1184,8 @@ void floor_apply() {
   floor_reported=false;floor_lease_ms=millis(); floor_event(0);
 }
 void floor_tick() {
+  static uint32_t last_airtime=0;
+  if(millis()-last_airtime>=100){last_airtime=millis();update_airtime();}
   if(uint32_t(millis()-floor_lease_ms)>180000) {
     floor_event(6); floor_event(4); floor_config.role=0;return;
   }
@@ -1172,7 +1216,79 @@ void floor_tick() {
 }
 #endif
 
+#if RNODE_GAME_TURNS
+static void turns_write(uint8_t cmd,const uint8_t*p,size_t n) {
+  serial_write(FEND);serial_write(cmd);
+  for(size_t i=0;i<n;i++){uint8_t b=p[i];if(b==FEND){serial_write(FESC);b=TFEND;}else if(b==FESC){serial_write(FESC);b=TFESC;}serial_write(b);}
+  serial_write(FEND);
+}
+void turns_report() {
+  uint8_t p[44];const uint64_t session=game_turns.config.session;
+  cat_game_turns::put32(p,uint32_t(session));cat_game_turns::put32(p+4,uint32_t(session>>32));
+  for(unsigned i=0;i<8;i++)cat_game_turns::put32(p+8+4*i,game_turns.stats[i]);
+  cat_game_turns::put32(p+40,cat_game_turns::crc32(p,40));
+  turns_write(0x78,p,sizeof(p));
+}
+static void turns_fallback(bool warm) {
+  if(!radio_online)return;
+  LoRa->standby();uint8_t fallback=warm?0x30:0x20;
+  LoRa->executeOpcode(0x93,&fallback,1);lora_receive();
+}
+void turns_stop() {
+  game_turns.active=false;game_turns.waiting=false;
+  // Discard pending experiment packets, including partially received host data.
+  while(!fifo16_isempty(&packet_starts)){fifo16_pop(&packet_starts);fifo16_pop(&packet_lengths);}
+  queue_height=queued_bytes=queue_cursor=current_packet_start=0;
+  turns_host_head=turns_host_tail=0;
+  if(IN_FRAME&&command==CMD_DATA) {
+    IN_FRAME=ESCAPE=false;command=CMD_UNKNOWN;frame_len=0;
+    hostf_cursor_at_open=hostf_arrival_cur=0;
+#if defined(RNODE_RP2040_UART_HOST)
+    hostcrc_calc=0xffff;hostcrc_lagn=0;
+#endif
+  }
+  cw_wait_passed=0;cw_wait_start=difs_wait_start=-1;csma_cw=-1;
+  turns_fallback(false);
+}
+static void turns_apply() {
+  cat_game_turns::Control c;
+  if(!c.decode(turns_control,frame_len)){kiss_indicate_error(0x71);return;}
+  if(c.op==1) {
+    if(game_turns.active&&game_turns.matches(c)){game_turns.lease=millis();} // Idempotent config retry.
+    else {
+      if(game_turns.active||!radio_online||implicit||promisc||queue_height||lora_sf<5||lora_sf>7||lora_bw!=500000||lora_cr!=5){kiss_indicate_error(0x72);return;}
+      game_turns.start(c,millis());turns_configured=true;turns_host_head=turns_host_tail=0;
+      turns_fallback(game_turns.warm());
+    }
+  } else {
+    if(!game_turns.matches(c)||(c.op!=0&&!game_turns.active)){kiss_indicate_error(0x73);return;}
+    if(c.op==0){turns_report();turns_stop();}
+    else if(c.op==2)game_turns.lease=millis();
+    else turns_report();
+  }
+  turns_write(0x79,turns_control,20);
+}
+static void turns_tick() {
+  if(!game_turns.active)return;
+  if(game_turns.expired(millis())){turns_report();turns_stop();kiss_indicate_error(0x74);return;}
+  if(queue_height>game_turns.stats[4])game_turns.stats[4]=queue_height;
+  // Utilization must age even while a nonzero limit blocks all transmission.
+  static uint32_t last_airtime=0;
+  if(millis()-last_airtime>=100){last_airtime=millis();update_airtime();}
+}
+#endif
+
 void serial_callback(uint8_t sbyte) {
+#if RNODE_GAME_TURNS
+  if(IN_FRAME&&command==0x79) {
+    if(sbyte==FEND){if(!ESCAPE)turns_apply();else kiss_indicate_error(0x71);IN_FRAME=false;ESCAPE=false;return;}
+    if(sbyte==FESC){if(ESCAPE)frame_len=21;ESCAPE=true;return;}
+    if(ESCAPE){if(sbyte==TFEND)sbyte=FEND;else if(sbyte==TFESC)sbyte=FESC;else frame_len=21;ESCAPE=false;}
+    if(frame_len<20)turns_control[frame_len]=sbyte;
+    if(frame_len<21)++frame_len;
+    return;
+  }
+#endif
 #if RNODE_RADIO_FLOOR
   // Unlike legacy setters, apply only on the closing delimiter and exact size.
   if(IN_FRAME && command==0x7c) {
@@ -1229,6 +1345,13 @@ void serial_callback(uint8_t sbyte) {
         else        { l = 1; }
 
         if (l >= MIN_L) {
+            #if RNODE_GAME_TURNS
+            if(turns_configured && !game_turns.active) {
+              queue_cursor=hostf_cursor_at_open;queued_bytes=queued_bytes>=hostf_stored?queued_bytes-hostf_stored:0;current_packet_start=queue_cursor;return;
+            }
+            turns_host_ms[turns_host_head]=millis();
+            turns_host_head=(turns_host_head+1)%CONFIG_QUEUE_MAX_LENGTH;
+#endif
             queue_height++;
             fifo16_push(&packet_starts, s);
             fifo16_push(&packet_lengths, l);
@@ -2332,6 +2455,23 @@ void validate_status() {
 #endif
 
 void tx_queue_handler() {
+#if RNODE_GAME_TURNS
+  if(turns_configured&&!game_turns.active)return;
+  if(game_turns.active&&game_turns.turns()) {
+    if(!modem_packet_queue_empty())return;
+    game_turns.expire(millis());
+    if(airtime_lock&&queue_height)++game_turns.stats[5];
+    if(game_turns.config.role==2) {
+      // Coordinator retains carrier sensing/backoff for each new exchange.
+      if(game_turns.waiting)return;
+    } else {
+      // Only a matching RP-generated reply may consume the reserved turn.
+      // The transmit admission guard discards stale or unsolicited packets.
+      if(queue_height&&!airtime_lock&&medium_free())pop_queue();
+      return;
+    }
+  }
+#endif
   if (!airtime_lock && queue_height > 0) {
     if (csma_cw == -1) {
       csma_cw = random(cw_min, cw_max);
@@ -2373,6 +2513,9 @@ void tx_queue_handler() {
 void work_while_waiting() { loop(); }
 
 void loop() {
+#if RNODE_GAME_TURNS
+  turns_tick();
+#endif
   #if MCU_VARIANT == MCU_RP2040
     rp2040.wdt_reset();
     rp2040_radio_sentinel();
@@ -2427,14 +2570,28 @@ void loop() {
       if (!modem_packet_queue_empty()) {
         modem_packet_t *modem_packet = &modem_packet_slots[modem_packet_head];
         host_write_len = modem_packet->len;
+#if RNODE_GAME_TURNS
+        cat_game_turns::Packet p;
+        const bool accepted=!game_turns.active ||
+          (cat_game_turns::packet(modem_packet->data,modem_packet->len,p)&&
+           game_turns.receive(p,turns_rx_ms[modem_packet_head],millis()));
+        if(accepted) {
+#endif
         last_rssi      = modem_packet->rssi;
         last_snr_raw   = modem_packet->snr_raw;
         memcpy(&pbuf, modem_packet->data, modem_packet->len);
+#if !RNODE_GAME_TURNS
         modem_packet_head = (uint8_t)((modem_packet_head+1) % MODEM_QUEUE_SIZE);
+#endif
 
         kiss_indicate_stat_rssi();
         kiss_indicate_stat_snr();
         kiss_write_packet();
+#if RNODE_GAME_TURNS
+        }
+        // Always release the RX slot and service UART, even for rejected RF data.
+        modem_packet_head = (uint8_t)((modem_packet_head+1) % MODEM_QUEUE_SIZE);
+#endif
       }
 
       airtime_lock = false;
