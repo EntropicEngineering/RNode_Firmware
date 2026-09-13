@@ -1242,7 +1242,10 @@ void turns_stop() {
   turns_host_head=turns_host_tail=0;
   if(IN_FRAME&&command==CMD_DATA) {
     IN_FRAME=ESCAPE=false;command=CMD_UNKNOWN;frame_len=0;
-    hostf_cursor_at_open=hostf_arrival_cur=0;
+    hostf_cursor_at_open=0;
+#if CAT_TEST_INSTRUMENTATION
+    hostf_arrival_cur=0;
+#endif
 #if defined(RNODE_RP2040_UART_HOST)
     hostcrc_calc=0xffff;hostcrc_lagn=0;
 #endif
