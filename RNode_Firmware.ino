@@ -817,7 +817,11 @@ bool startRadio() {
         // Flash an info pattern to indicate
         // that the radio is now on
         kiss_indicate_radiostate();
+#if !RNODE_GAME_MODE
+        // The 600 ms animation blocks host/RF service after ONLINE is reported.
+        // Game mode must be ready to accept the first packet immediately.
         led_indicate_info(3);
+#endif
         return true;
       }
 
