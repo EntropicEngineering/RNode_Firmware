@@ -58,7 +58,10 @@ struct State {
   if(p.type!=1||uint32_t(now-stamp)>=config.window_ms)return false;
   // One grant per sequence, including after it expired or was consumed.
   if(seen&&int32_t(p.seq-sequence)<=0)return false;
-  if(waiting&&uint32_t(stamp-since)<config.window_ms)return false;
+  if(waiting) {
+   if(uint32_t(stamp-since)<config.window_ms)return false;
+   waiting=false;++stats[2];
+  }
   seen=waiting=true;sequence=p.seq;since=stamp;++stats[1];return true;
  }
  bool can_send(const Packet&p,uint32_t now,uint32_t airtime_ms){
