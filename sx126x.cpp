@@ -20,6 +20,7 @@
 #define OP_STANDBY_6X               0x80
 #define OP_TX_6X                    0x83
 #define OP_RX_6X                    0x82
+#define OP_RX_TX_FALLBACK_6X        0x93
 #define OP_PA_CONFIG_6X             0x95
 #define OP_SET_IRQ_FLAGS_6X         0x08 // Also provides info such as
                                          // preamble detection, etc for
@@ -351,6 +352,15 @@ int sx126x::begin(long frequency) {
   enableTCXO();
   loraMode();
   standby();
+#if RNODE_RADIO_FLOOR
+  // Default STDBY_RC after TX stops the TCXO. With RAK's 0xff startup
+  // delay, RX is deaf for roughly 4 ms even after SetRx returns. Keep XOSC
+  // running in this explicitly opted-in radio-floor build. Normal builds
+  // retain the chip default. See Semtech sx126x_set_rx_tx_fallback_mode.
+  uint8_t fallback = 0x30; // STDBY_XOSC
+  executeOpcode(OP_RX_TX_FALLBACK_6X, &fallback, 1);
+#endif
+
 
   // Set sync word
   setSyncWord(SYNC_WORD_6X);
