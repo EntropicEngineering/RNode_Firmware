@@ -15,11 +15,12 @@ inline uint16_t get16(const uint8_t *p) { return uint16_t(p[0]) | uint16_t(p[1])
 struct Config {
     uint8_t role=0, bytes=36;
     uint32_t session=0;
-    uint16_t count=0, interval_ms=250, timeout_ms=2000;
+    uint16_t count=0, interval_ms=250, timeout_ms=2000, guard_us=0;
     bool decode(const uint8_t *p, size_t n) {
-        if(n!=16 || p[0]!=1 || p[1]>2 || p[2] || p[3] || p[15]) return false;
-        Config c; c.role=p[1]; c.session=get32(p+4); c.count=get16(p+8);
+        if(n!=16 || p[0]!=1 || p[1]>2 || p[15]) return false;
+        Config c; c.guard_us=get16(p+2); c.role=p[1]; c.session=get32(p+4); c.count=get16(p+8);
         c.interval_ms=get16(p+10); c.timeout_ms=get16(p+12); c.bytes=p[14];
+        if(c.guard_us>5000) return false;
         if(c.role && (!c.session || !c.count || c.count>500 || c.interval_ms<20 || c.interval_ms>1000 || c.timeout_ms<100 || c.timeout_ms>5000 || (c.bytes!=16 && c.bytes!=36))) return false;
         *this=c; return true;
     }

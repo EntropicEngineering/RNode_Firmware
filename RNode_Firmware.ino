@@ -1113,12 +1113,23 @@ bool floor_can_tx() {
   return !(st_airtime_limit!=0.0 && airtime>=st_airtime_limit) &&
          !(lt_airtime_limit!=0.0 && longterm_airtime>=lt_airtime_limit);
 }
-void floor_tx(uint8_t *p, uint32_t rx_stamp=0, bool reply=false) {
+bool floor_tx(uint8_t *p, uint32_t rx_stamp=0, bool reply=false) {
   // Starts before the driver API. Peer turn ends at the equivalent boundary.
-  if(reply) cat_radio_floor::put32(p+12,uint32_t(micros()-rx_stamp));
-  else floor_probe.begin(micros());
-  LoRa->beginPacket(); LoRa->write(p,floor_config.bytes); LoRa->endPacket();
-  lora_receive(); add_airtime(floor_config.bytes); update_airtime();
+  if(reply) {
+    // A bounded, measured RX-to-reply guard lets the peer re-arm its receiver.
+    // Sweep down to zero explicitly; this is included in reported peer turn.
+    while(uint32_t(micros()-rx_stamp)<floor_config.guard_us) rp2040.wdt_reset();
+  }
+  const uint32_t start=micros();
+  if(reply) cat_radio_floor::put32(p+12,uint32_t(start-rx_stamp));
+  else floor_probe.begin(start);
+  LoRa->beginPacket(); LoRa->write(p,floor_config.bytes);
+  const bool sent=LoRa->endPacket(); const uint32_t tx_done=micros();
+  lora_receive(); const uint32_t rx_armed=micros();
+  add_airtime(floor_config.bytes); update_airtime();
+  if(cat_radio_floor::get32(p+8)==0) floor_event(7,0,tx_done-start,rx_armed-start);
+  if(!sent) floor_event(5);
+  return sent;
 }
 void floor_apply() {
   cat_radio_floor::Config next;
@@ -1141,7 +1152,7 @@ void floor_tick() {
     __dmb();modem_packet_head=(head+1)%MODEM_QUEUE_SIZE;
     if(!cat_radio_floor::valid(p,n,floor_config)) ++floor_invalid;
     else if(floor_config.role==1 && p[3]==1) {
-      if(floor_can_tx()) { p[3]=2; floor_tx(p,stamp,true); ++floor_replies; }
+      if(floor_can_tx()) { p[3]=2; if(floor_tx(p,stamp,true)) ++floor_replies; }
       else ++floor_blocked;
     } else if(floor_config.role==2 && p[3]==2) {
       const uint32_t seq=cat_radio_floor::get32(p+8), turn=cat_radio_floor::get32(p+12);
