@@ -16,6 +16,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include "Utilities.h"
+#include "RadioFloor.h"
 #if MCU_VARIANT == MCU_RP2040 && defined(RNODE_RP2040_UART_HOST)
   #include <hardware/dma.h>
   #include <hardware/irq.h>
@@ -273,6 +274,16 @@ static int uart1_host_read() {
   static volatile uint8_t modem_packet_tail = 0; // producer
   static inline bool modem_packet_queue_full()  { return (uint8_t)((modem_packet_tail+1) % MODEM_QUEUE_SIZE) == modem_packet_head; }
   static inline bool modem_packet_queue_empty() { return modem_packet_head == modem_packet_tail; }
+#endif
+
+#if RNODE_RADIO_FLOOR
+static cat_radio_floor::Config floor_config;
+static cat_radio_floor::Probe floor_probe;
+static uint32_t floor_rx_us[MODEM_QUEUE_SIZE];
+static volatile uint32_t floor_queue_drops=0;
+static uint32_t floor_invalid=0, floor_replies=0, floor_blocked=0, floor_lease_ms=0;
+static bool floor_reported=false;
+static uint8_t floor_control[16];
 #endif
 
 char sbuf[128];
@@ -626,6 +637,23 @@ inline void getPacketData(uint16_t len) {
 }
 
 void ISR_VECT receive_callback(int packet_size) {
+#if RNODE_RADIO_FLOOR
+  if (floor_config.role) {
+    const uint32_t stamp=micros();
+    if (packet_size<16 || packet_size>36 || modem_packet_queue_full()) {
+      ++floor_queue_drops;
+      while(LoRa->available()) LoRa->read();
+      return;
+    }
+    const uint8_t tail=modem_packet_tail;
+    modem_packet_t &p=modem_packet_slots[tail];
+    p.len=packet_size; floor_rx_us[tail]=stamp;
+    for(int i=0;i<packet_size;i++) p.data[i]=LoRa->read();
+    __dmb(); modem_packet_tail=(tail+1)%MODEM_QUEUE_SIZE;
+    return;
+  }
+#endif
+
   #if MCU_VARIANT == MCU_NRF52
     BaseType_t int_mask;
   #endif
@@ -1059,7 +1087,93 @@ void transmit(uint16_t size) {
   } else { kiss_indicate_error(ERROR_TXFAILED); led_indicate_error(5); }
 }
 
+#if RNODE_RADIO_FLOOR
+// USB is only a control/log link. Neither its arrival time nor its latency is
+// used for RTT. All timing is uint32 micros on the initiating radio.
+void floor_event(uint8_t kind, uint32_t seq=0, uint32_t rtt=0, uint32_t turn=0) {
+  uint8_t b[32]={1,kind,floor_config.role,0};
+  cat_radio_floor::put32(b+4,floor_config.session);
+  cat_radio_floor::put32(b+8,seq);cat_radio_floor::put32(b+12,rtt);
+  cat_radio_floor::put32(b+16,turn);cat_radio_floor::put32(b+20,floor_probe.sent);
+  cat_radio_floor::put32(b+24,floor_probe.received);cat_radio_floor::put32(b+28,floor_probe.timed_out);
+  if(kind==4) {
+    cat_radio_floor::put32(b+8,floor_queue_drops);cat_radio_floor::put32(b+12,floor_invalid);
+    cat_radio_floor::put32(b+16,floor_blocked);cat_radio_floor::put32(b+20,floor_replies);
+    cat_radio_floor::put32(b+24,floor_probe.rejected);
+  }
+  Serial.write(FEND);Serial.write(0x7b);
+  for(uint8_t x:b) {
+    if(x==FEND) { Serial.write(FESC);Serial.write(TFEND); }
+    else if(x==FESC) { Serial.write(FESC);Serial.write(TFESC); }
+    else Serial.write(x);
+  }
+  Serial.write(FEND);
+}
+bool floor_can_tx() {
+  return !(st_airtime_limit!=0.0 && airtime>=st_airtime_limit) &&
+         !(lt_airtime_limit!=0.0 && longterm_airtime>=lt_airtime_limit);
+}
+void floor_tx(uint8_t *p, uint32_t rx_stamp=0, bool reply=false) {
+  // Starts before the driver API. Peer turn ends at the equivalent boundary.
+  if(reply) cat_radio_floor::put32(p+12,uint32_t(micros()-rx_stamp));
+  else floor_probe.begin(micros());
+  LoRa->beginPacket(); LoRa->write(p,floor_config.bytes); LoRa->endPacket();
+  lora_receive(); add_airtime(floor_config.bytes); update_airtime();
+}
+void floor_apply() {
+  cat_radio_floor::Config next;
+  if(!next.decode(floor_control,frame_len) || (next.role && (!radio_online || implicit || queue_height))) { floor_event(5); return; }
+  if(!next.role && floor_config.role) floor_event(4);
+  // Complete frame validation precedes state change; never persist this mode.
+  noInterrupts(); floor_config=next; modem_packet_head=modem_packet_tail;
+  floor_queue_drops=0; interrupts();
+  floor_probe=cat_radio_floor::Probe();floor_invalid=0;floor_replies=0;floor_blocked=0;
+  floor_reported=false;floor_lease_ms=millis(); floor_event(0);
+}
+void floor_tick() {
+  if(uint32_t(millis()-floor_lease_ms)>180000) {
+    floor_event(6); floor_event(4); floor_config.role=0;return;
+  }
+  if(!modem_packet_queue_empty()) {
+    const uint8_t head=modem_packet_head;
+    uint8_t p[36]; const size_t n=modem_packet_slots[head].len;
+    const uint32_t stamp=floor_rx_us[head]; memcpy(p,modem_packet_slots[head].data,n);
+    __dmb();modem_packet_head=(head+1)%MODEM_QUEUE_SIZE;
+    if(!cat_radio_floor::valid(p,n,floor_config)) ++floor_invalid;
+    else if(floor_config.role==1 && p[3]==1) {
+      if(floor_can_tx()) { p[3]=2; floor_tx(p,stamp,true); ++floor_replies; }
+      else ++floor_blocked;
+    } else if(floor_config.role==2 && p[3]==2) {
+      const uint32_t seq=cat_radio_floor::get32(p+8), turn=cat_radio_floor::get32(p+12);
+      const uint32_t rtt=stamp-floor_probe.start;
+      if(floor_probe.accept(seq,stamp,turn,floor_config)) floor_event(1,seq,rtt,turn);
+    } else ++floor_invalid;
+  }
+  if(floor_config.role!=2) return;
+  uint32_t now=micros();
+  if(floor_probe.expire(now,floor_config)) floor_event(2,floor_probe.sent-1);
+  if(floor_probe.done(floor_config)) {
+    if(!floor_reported) { floor_event(3);floor_event(4);floor_reported=true; }
+  } else if(floor_probe.due(now,floor_config) && floor_can_tx()) {
+    uint8_t p[36];cat_radio_floor::packet(p,floor_config.bytes,1,floor_config.session,floor_probe.sent);
+    floor_tx(p);
+  }
+}
+#endif
+
 void serial_callback(uint8_t sbyte) {
+#if RNODE_RADIO_FLOOR
+  // Unlike legacy setters, apply only on the closing delimiter and exact size.
+  if(IN_FRAME && command==0x7c) {
+    if(sbyte==FEND) { if(!ESCAPE) floor_apply(); else floor_event(5); IN_FRAME=false; ESCAPE=false; return; }
+    if(sbyte==FESC) { ESCAPE=true; return; }
+    if(ESCAPE) { if(sbyte==TFEND) sbyte=FEND; else if(sbyte==TFESC) sbyte=FESC; else { frame_len=17; } ESCAPE=false; }
+    if(frame_len<16) floor_control[frame_len]=sbyte;
+    if(frame_len<17) ++frame_len;
+    return;
+  }
+#endif
+
   if (IN_FRAME && sbyte == FEND && command == CMD_DATA) {
     IN_FRAME = false;
 
@@ -2253,6 +2367,10 @@ void loop() {
     rp2040_radio_sentinel();
   #endif
 
+#if RNODE_RADIO_FLOOR
+  if (floor_config.role && radio_online) { floor_tick(); }
+  else
+#endif
   if (radio_online) {
     #if MCU_VARIANT == MCU_ESP32
       modem_packet_t *modem_packet = NULL;
