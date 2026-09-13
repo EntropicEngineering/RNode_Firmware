@@ -15,6 +15,10 @@
 
 #include "ROM.h"
 #include "Boards.h"
+#include "GameRadio.h"
+#if RNODE_GAME_MODE && (MCU_VARIANT != MCU_RP2040 || BOARD_MODEL != BOARD_RAK11300)
+#error "Experimental game profile is qualified only for RAK11300"
+#endif
 
 #ifndef CONFIG_H
 	#define CONFIG_H
@@ -107,7 +111,11 @@
 	#define CSMA_SLOT_SYMBOLS          12
 	#define CSMA_CW_BANDS              4
 	#define CSMA_CW_MIN                0
+	#if RNODE_GAME_MODE
+	#define CSMA_CW_PER_BAND_WINDOWS   cat_game_radio::cw_windows
+	#else
 	#define CSMA_CW_PER_BAND_WINDOWS   15
+	#endif
 	#define CSMA_BAND_1_MAX_AIRTIME    7
 	#define CSMA_BAND_N_MIN_AIRTIME    85
 	#define CSMA_INFR_THRESHOLD_DB     11

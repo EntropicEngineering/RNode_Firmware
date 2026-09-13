@@ -1387,6 +1387,13 @@ void serial_callback(uint8_t sbyte) {
         if (frame_len == 2) {
           eeprom_write(cmdbuf[0], cmdbuf[1]);
         }
+#if RNODE_GAME_MODE
+    } else if (command == 0x7E) { // Read-only experimental profile attestation.
+      serial_write(FEND); serial_write(0x7E);
+      serial_write(1); // Wire schema.
+      serial_write(1); // Dedicated game profile enabled.
+      serial_write(FEND);
+#endif
     } else if (command == CMD_FW_VERSION) {
       kiss_indicate_version();
     } else if (command == CMD_PLATFORM) {
@@ -2184,7 +2191,12 @@ void validate_status() {
     if (new_cw_band != cw_band) { 
       cw_band = (uint8_t)(new_cw_band);
       cw_min  = (cw_band-1) * CSMA_CW_PER_BAND_WINDOWS;
+#if RNODE_GAME_MODE
+      // Arduino random() excludes the upper bound.
+      cw_max = cw_band * CSMA_CW_PER_BAND_WINDOWS;
+#else
       cw_max  = (cw_band) * CSMA_CW_PER_BAND_WINDOWS - 1;
+#endif
       kiss_indicate_csma_stats();
     }
   }
@@ -2211,7 +2223,12 @@ void tx_queue_handler() {
             cw_wait_passed += millis()-cw_wait_start; cw_wait_start   = millis();
             if (cw_wait_passed < cw_wait_target) { return; }                      // Contention window wait time has not yet passed, continue waiting
             else {                                                                // Wait time has passed, flush the queue
+#if RNODE_GAME_MODE
+              // Yield and sense the channel between every queued game packet.
+              bool should_flush = false;
+#else
               bool should_flush = !lora_limit_rate && !lora_guard_rate;
+#endif
               if (should_flush) { flush_queue(); } else { pop_queue(); }
               // A new packet gets a new contention window. Keeping the old
               // start counts TX/idle time toward that packet's random backoff.

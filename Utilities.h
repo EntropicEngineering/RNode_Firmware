@@ -1281,10 +1281,20 @@ void updateBitrate() {
 			lora_bitrate = (uint32_t)(lora_sf * ( (4.0/(float)lora_cr) / ((float)(pow(2, lora_sf))/((float)lora_bw/1000.0)) ) * 1000.0);
 			lora_us_per_byte = 1000000.0/((float)lora_bitrate/8.0);
 			
+#if !RNODE_GAME_MODE
 			bool fast_rate   = lora_bitrate > LORA_FAST_THRESHOLD_BPS;
+#endif
 			lora_limit_rate  = lora_bitrate > LORA_LIMIT_THRESHOLD_BPS;
 			lora_guard_rate  = (!lora_limit_rate && lora_bitrate > LORA_GUARD_THRESHOLD_BPS);
 
+#if RNODE_GAME_MODE
+            csma_slot_ms = cat_game_radio::slot_ms(lora_sf, lora_bw);
+            difs_ms = CSMA_SIFS_MS + 2*csma_slot_ms;
+            lora_preamble_symbols = cat_game_radio::preamble(lora_sf);
+            lora_preamble_time_ms = (ceil)(lora_preamble_symbols * lora_symbol_time_ms);
+            lora_header_time_ms = (ceil)(PHY_HEADER_LORA_SYMBOLS * lora_symbol_time_ms);
+            setPreamble(); // Report the newly computed timing, not stale fields.
+#else
 			int csma_slot_min_ms = CSMA_SLOT_MIN_MS;
 			float lora_preamble_target_ms = LORA_PREAMBLE_TARGET_MS;
 			if (fast_rate) { csma_slot_min_ms        -= CSMA_SLOT_MIN_FAST_DELTA;
@@ -1302,6 +1312,7 @@ void updateBitrate() {
 			lora_preamble_symbols = (long)target_preamble_symbols; setPreamble();
 			lora_preamble_time_ms = (ceil)(lora_preamble_symbols * lora_symbol_time_ms);
 			lora_header_time_ms   = (ceil)(PHY_HEADER_LORA_SYMBOLS * lora_symbol_time_ms);
+#endif
 		}
 	#endif
 }
