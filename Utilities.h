@@ -1904,7 +1904,16 @@ void eeprom_conf_delete() {
 }
 
 void unlock_rom() {
-	led_indicate_error(50);
+	#if MCU_VARIANT == MCU_RP2040
+		// The 10 s warning blink outlasts the 8 s board watchdog, which would
+		// reboot before the erase and leave the EEPROM untouched.
+		for (int cycle = 0; cycle < 50; cycle++) {
+			led_indicate_error(1);
+			rp2040.wdt_reset();
+		}
+	#else
+		led_indicate_error(50);
+	#endif
 	eeprom_erase();
 }
 
